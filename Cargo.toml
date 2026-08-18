@@ -1,0 +1,25 @@
+[package]
+name = "icp_stitch"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Offline loop-closure post-processing for dimos memory2 recordings: tag PGO + ICP stitching, all in Rust"
+repository = "https://github.com/jeff-hykin/icp_stitch"
+
+[[bin]]
+name = "icp_stitch"
+path = "src/main.rs"
+
+[dependencies]
+gtsam_shim = { git = "https://github.com/jeff-hykin/gtsam_shim" }
+lcm-msgs = { git = "https://github.com/dimensionalOS/dimos-lcm.git", rev = "3555e97704ec4c727d96a7ac0769d5735bb44feb" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+nalgebra = "0.33"
+ahash = "0.8"
+arrayvec = "0.7"
+serde_json = "1"
+kornia-apriltag = "0.1.10"
+kornia-image = "0.1.10"
+zune-jpeg = "0.5.15"
