@@ -118,6 +118,7 @@ pub fn read_camera_info(
         return Ok(None);
     };
     let data: Vec<u8> = row.get(0).map_err(|e| e.to_string())?;
+    let data = crate::memory2::decompress_if_lz4(data);
     let info = CameraInfo::decode(&data).map_err(|e| e.to_string())?;
     Ok(Some((
         CameraModel::from_info(&info.K, &info.D),
@@ -606,6 +607,7 @@ pub fn detect_raw_detections(
     for row in rows {
         let (ts, data) = row.map_err(|e| e.to_string())?;
         image_count += 1;
+        let data = crate::memory2::decompress_if_lz4(data);
         let Ok(message) = LcmImage::decode(&data) else {
             continue;
         };
@@ -783,6 +785,7 @@ pub fn read_raw_tag_stream(
     let mut detections = Vec::new();
     for row in rows {
         let (ts, data, tag_values) = row.map_err(|e| e.to_string())?;
+        let data = crate::memory2::decompress_if_lz4(data);
         let message = lcm_msgs::geometry_msgs::PoseStamped::decode(&data)
             .map_err(|e| format!("{stream_name}: {e}"))?;
         let mut numbers = [None; 6];

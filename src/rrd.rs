@@ -397,6 +397,7 @@ fn camera_frame_at(
             |row| row.get(0),
         )
         .ok()?;
+    let blob = memory2::decompress_if_lz4(blob);
     let image = LcmImage::decode(&blob).ok()?;
     decode_rgb(&image).ok()
 }

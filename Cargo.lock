@@ -1537,6 +1537,7 @@ dependencies = [
  "kornia-apriltag",
  "kornia-image",
  "lcm-msgs",
+ "lz4_flex 0.11.6",
  "nalgebra 0.33.3",
  "rayon",
  "rerun",
@@ -2035,6 +2036,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d8a05e3879b317b1b6dbf353e5bba7062bedcc59815267bb23eaa0c576cebf0"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -3096,7 +3106,7 @@ dependencies = [
  "bytes",
  "crossbeam",
  "itertools 0.14.0",
- "lz4_flex",
+ "lz4_flex 0.13.1",
  "parking_lot",
  "re_arrow_util",
  "re_build_info",
@@ -3214,7 +3224,7 @@ dependencies = [
  "arrow",
  "http",
  "jiff",
- "lz4_flex",
+ "lz4_flex 0.13.1",
  "opentelemetry",
  "pin-project-lite",
  "prost",

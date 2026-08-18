@@ -51,6 +51,19 @@ pub struct ScanRow {
     pub frame_id: String,
 }
 
+/// Streams recorded with the `lz4+lcm` codec wrap the lcm bytes in an LZ4
+/// frame. Sniff the frame magic and unwrap; plain `lcm` blobs pass through.
+pub fn decompress_if_lz4(data: Vec<u8>) -> Vec<u8> {
+    if data.len() >= 4 && data[..4] == [0x04, 0x22, 0x4D, 0x18] {
+        let mut decoder = lz4_flex::frame::FrameDecoder::new(&data[..]);
+        let mut raw = Vec::new();
+        if std::io::Read::read_to_end(&mut decoder, &mut raw).is_ok() {
+            return raw;
+        }
+    }
+    data
+}
+
 fn quote_ident(name: &str) -> Result<String, String> {
     if name.contains('"') {
         return Err(format!("illegal stream name {name:?}"));
@@ -92,6 +105,7 @@ fn read_stream<T>(
             continue;
         }
         let (ts, data) = row.map_err(|e| e.to_string())?;
+        let data = decompress_if_lz4(data);
         if let Some(value) = decode(ts, &data) {
             out.push(value);
         }
