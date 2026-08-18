@@ -571,6 +571,7 @@ fn run(args: Args) -> Result<(), String> {
         }
         if args.rrd {
             icp_stitch::rrd::build_and_open_rrd(
+                &connection,
                 db_path,
                 &lidar_stream,
                 &odom_stream,

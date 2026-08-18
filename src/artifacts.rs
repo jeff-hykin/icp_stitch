@@ -50,7 +50,7 @@ pub(crate) const POINTCLOUD2_MODULE: &str = "dimos.msgs.sensor_msgs.PointCloud2.
 const GRAPH3D_MODULE: &str = "dimos.navigation.jnav.msgs.Graph3D.Graph3D";
 const DEFORMATION_NODE_MODULE: &str = "dimos.navigation.jnav.msgs.DeformationNode.DeformationNode";
 
-fn format_thousands(value: usize) -> String {
+pub fn format_thousands(value: usize) -> String {
     // python's f"{value:,}"
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
