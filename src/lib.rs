@@ -1,6 +1,7 @@
 pub mod apriltags;
 pub mod artifacts;
 pub mod detect;
+pub mod helpers;
 pub mod mat3;
 pub mod memory2;
 pub mod msgs;

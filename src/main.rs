@@ -11,7 +11,7 @@ use gtsam_shim::Pose3;
 use rusqlite::{Connection, OpenFlags};
 
 use icp_stitch::apriltags::{self, GlimpseGates};
-use icp_stitch::{artifacts, detect, mat3, memory2, pgo, recording, se3, tf};
+use icp_stitch::{artifacts, detect, helpers, mat3, memory2, pgo, recording, se3, tf};
 
 const ABOUT: &str = "\
 AprilTag-loop-closed + ICP-refined ground-truth post-processing for a recording.
@@ -29,10 +29,19 @@ aggregated <lidar>_corrected.pc2.lcm and a comparison rrd opened in rerun.
 --db is the recording .db file; its parent dir is where the .pc2.lcm outputs land. Camera
 intrinsics come from the recording's CameraInfo stream (auto-detected) and the base<-optical
 extrinsic from its tf tree; stream/frame defaults auto-detect the rig. With no CameraInfo
-stream the AprilTag stage is skipped and ICP loop closures alone drive the PGO.
+stream the AprilTag stage is skipped and ICP loop closures alone drive the PGO; a go2 recording
+can get one with --helper add_go2_camera_info.
 
 Usage:
-  icp_stitch --db PATH.db [--no-odom | --no-lidar] [options]";
+  icp_stitch --db PATH.db [--no-odom | --no-lidar] [options]
+  icp_stitch --db PATH.db --helper add_go2_camera_info";
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Helper {
+    /// write the static go2 front-camera 720p intrinsics as a `camera_info` stream
+    #[value(name = "add_go2_camera_info")]
+    AddGo2CameraInfo,
+}
 
 #[derive(Parser)]
 #[command(name = "icp_stitch", about = ABOUT)]
@@ -40,6 +49,9 @@ struct Args {
     /// recording .db file
     #[arg(long)]
     db: PathBuf,
+    /// run a one-shot recording fixup on --db and exit, instead of solving
+    #[arg(long = "helper", alias = "helpers", value_enum)]
+    helper: Option<Helper>,
     /// input lidar stream (auto if unset)
     #[arg(long, default_value = "")]
     lidar: String,
@@ -243,6 +255,14 @@ fn run(args: Args) -> Result<(), String> {
     let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|error| format!("cannot open {}: {error}", db_path.display()))?;
 
+    if let Some(helper) = args.helper {
+        return match helper {
+            Helper::AddGo2CameraInfo => {
+                helpers::add_go2_camera_info(&connection, &args.camera)
+            }
+        };
+    }
+
     // resolve stream/frame defaults from what the recording actually has
     let streams = memory2::list_streams(&connection)?;
     let (odom_stream, lidar_stream) = recording::resolve_streams(&streams, &args.odom, &args.lidar);
@@ -280,7 +300,7 @@ fn run(args: Args) -> Result<(), String> {
             println!(
                 "WARNING: no CameraInfo stream among ['{}'] -- AprilTag stage skipped; \
                  ICP + odom only. If this is a go2 recording, add the static front-camera \
-                 intrinsics first with scripts/add_camera_info.py, then re-run.",
+                 intrinsics first with --helper add_go2_camera_info, then re-run.",
                 camera_info_tried.join("', '")
             );
             (None, args.tag_frame.clone())

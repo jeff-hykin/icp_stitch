@@ -66,6 +66,20 @@ The corrected streams are written back into the same db (only derived streams ar
 added — the recording itself is never modified), so the run is repeatable and the
 outputs are regenerable.
 
+## Helpers
+
+`--helper <NAME>` runs a one-shot fixup on `--db` and exits instead of solving:
+
+```sh
+icp_stitch --db path/to/go2_recording.db --helper add_go2_camera_info
+```
+
+`add_go2_camera_info` writes the static go2 front-camera 720p intrinsics — the same
+`front_camera_720.yaml` calibration the live dimos `Go2Connection` publishes, fisheye
+`equidistant` model — as a `camera_info` stream in whatever frame the color images
+carry. go2 recordings ship without one, which is why the solve skips their AprilTag
+stage. It is additive and idempotent, and refuses to run if the images are not 720p.
+
 ## Development
 
 ```sh

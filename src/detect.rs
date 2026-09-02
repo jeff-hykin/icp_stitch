@@ -25,8 +25,30 @@ use crate::memory2;
 
 const POSE_STAMPED_MODULE: &str = "dimos.msgs.geometry_msgs.PoseStamped.PoseStamped";
 const UNDISTORT_ITERATIONS: usize = 5;
+const EQUIDISTANT_UNDISTORT_ITERATIONS: usize = 10;
+const RADIUS_EPSILON: f64 = 1e-12;
 
-/// Pinhole + OpenCV radtan/rational distortion, from a CameraInfo K and D.
+/// Which OpenCV lens model the CameraInfo `D` coefficients belong to. Radtan
+/// covers plumb_bob/rational_polynomial; wide-angle rigs (the go2 front camera)
+/// are calibrated as fisheye, where the same 4 numbers mean something else
+/// entirely.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DistortionModel {
+    Radtan,
+    Equidistant,
+}
+
+impl DistortionModel {
+    pub fn from_name(name: &str) -> DistortionModel {
+        if name.eq_ignore_ascii_case("equidistant") || name.eq_ignore_ascii_case("fisheye") {
+            DistortionModel::Equidistant
+        } else {
+            DistortionModel::Radtan
+        }
+    }
+}
+
+/// Pinhole + OpenCV distortion, from a CameraInfo K, D and distortion model.
 #[derive(Clone, Debug)]
 pub struct CameraModel {
     pub fx: f64,
@@ -34,12 +56,14 @@ pub struct CameraModel {
     pub cx: f64,
     pub cy: f64,
     pub skew: f64,
-    /// OpenCV order: k1, k2, p1, p2, k3, k4, k5, k6 (zero-padded).
+    /// Radtan order k1, k2, p1, p2, k3, k4, k5, k6; equidistant uses the first
+    /// four as k1..k4 (zero-padded either way).
     pub dist: [f64; 8],
+    pub distortion_model: DistortionModel,
 }
 
 impl CameraModel {
-    pub fn from_info(k: &[f64; 9], d: &[f64]) -> CameraModel {
+    pub fn from_info(k: &[f64; 9], d: &[f64], distortion_model: &str) -> CameraModel {
         let mut dist = [0.0; 8];
         for (slot, value) in dist.iter_mut().zip(d.iter()) {
             *slot = *value;
@@ -51,6 +75,7 @@ impl CameraModel {
             fy: k[4],
             cy: k[5],
             dist,
+            distortion_model: DistortionModel::from_name(distortion_model),
         }
     }
 
@@ -59,6 +84,9 @@ impl CameraModel {
     pub fn undistort(&self, pixel: &[f64; 2]) -> [f64; 2] {
         let y0 = (pixel[1] - self.cy) / self.fy;
         let x0 = (pixel[0] - self.cx - self.skew * y0) / self.fx;
+        if self.distortion_model == DistortionModel::Equidistant {
+            return self.undistort_equidistant(x0, y0);
+        }
         let [k1, k2, p1, p2, k3, k4, k5, k6] = self.dist;
         let (mut x, mut y) = (x0, y0);
         for _ in 0..UNDISTORT_ITERATIONS {
@@ -73,16 +101,50 @@ impl CameraModel {
         [x, y]
     }
 
+    /// `cv2.fisheye.undistortPoints`: the distorted radius *is* the distorted
+    /// angle, so solve theta by fixed-point iteration and re-expand with tan.
+    fn undistort_equidistant(&self, x0: f64, y0: f64) -> [f64; 2] {
+        let theta_distorted = (x0 * x0 + y0 * y0).sqrt();
+        if theta_distorted < RADIUS_EPSILON {
+            return [x0, y0];
+        }
+        let mut theta = theta_distorted;
+        for _ in 0..EQUIDISTANT_UNDISTORT_ITERATIONS {
+            theta = theta_distorted / self.equidistant_radial(theta);
+        }
+        let scale = theta.tan() / theta_distorted;
+        [x0 * scale, y0 * scale]
+    }
+
+    fn equidistant_radial(&self, theta: f64) -> f64 {
+        let [k1, k2, k3, k4, ..] = self.dist;
+        let t2 = theta * theta;
+        1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4)))
+    }
+
     /// Camera-frame point -> distorted pixel (`cv2.projectPoints` math).
     pub fn project(&self, point: &Vec3) -> [f64; 2] {
         let x = point[0] / point[2];
         let y = point[1] / point[2];
-        let [k1, k2, p1, p2, k3, k4, k5, k6] = self.dist;
-        let r2 = x * x + y * y;
-        let radial = (1.0 + ((k3 * r2 + k2) * r2 + k1) * r2)
-            / (1.0 + ((k6 * r2 + k5) * r2 + k4) * r2);
-        let xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
-        let yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
+        let (xd, yd) = if self.distortion_model == DistortionModel::Equidistant {
+            let radius = (x * x + y * y).sqrt();
+            let theta = radius.atan();
+            let scale = if radius < RADIUS_EPSILON {
+                1.0
+            } else {
+                theta * self.equidistant_radial(theta) / radius
+            };
+            (x * scale, y * scale)
+        } else {
+            let [k1, k2, p1, p2, k3, k4, k5, k6] = self.dist;
+            let r2 = x * x + y * y;
+            let radial = (1.0 + ((k3 * r2 + k2) * r2 + k1) * r2)
+                / (1.0 + ((k6 * r2 + k5) * r2 + k4) * r2);
+            (
+                x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x),
+                y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y,
+            )
+        };
         [
             self.fx * xd + self.skew * yd + self.cx,
             self.fy * yd + self.cy,
@@ -121,7 +183,7 @@ pub fn read_camera_info(
     let data = crate::memory2::decompress_if_lz4(data);
     let info = CameraInfo::decode(&data).map_err(|e| e.to_string())?;
     Ok(Some((
-        CameraModel::from_info(&info.K, &info.D),
+        CameraModel::from_info(&info.K, &info.D, &info.distortion_model),
         info.header.frame_id,
     )))
 }
@@ -669,7 +731,7 @@ pub fn detect_raw_detections(
 
 // ---- tag stream persistence ----------------------------------------------------
 
-fn sec_nsec(ts: f64) -> (i32, i32) {
+pub fn sec_nsec(ts: f64) -> (i32, i32) {
     let seconds = ts as i64;
     (seconds as i32, ((ts - seconds as f64) * 1_000_000_000.0) as i32)
 }
@@ -870,6 +932,20 @@ mod tests {
             cy: 240.0,
             skew: 0.0,
             dist: [0.0; 8],
+            distortion_model: DistortionModel::Radtan,
+        }
+    }
+
+    #[test]
+    fn equidistant_undistort_project_roundtrip() {
+        let mut camera = test_camera();
+        camera.distortion_model = DistortionModel::Equidistant;
+        camera.dist = [-0.073, -0.023, -0.0069, 0.0092, 0.0, 0.0, 0.0, 0.0];
+        for pixel in [[100.0, 80.0], [320.0, 240.0], [500.0, 400.0]] {
+            let [x, y] = camera.undistort(&pixel);
+            let reprojected = camera.project(&[x, y, 1.0]);
+            assert!((reprojected[0] - pixel[0]).abs() < 1e-3, "{pixel:?} -> {reprojected:?}");
+            assert!((reprojected[1] - pixel[1]).abs() < 1e-3);
         }
     }
 
