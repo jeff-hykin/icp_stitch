@@ -11,7 +11,7 @@ use crate::se3;
 use gtsam_shim::Pose3;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-const STATIC_POSE_TOLERANCE: f64 = 1e-6;
+pub(crate) const STATIC_POSE_TOLERANCE: f64 = 1e-6;
 
 pub struct RecordingTf {
     edges: HashMap<(String, String), Vec<(f64, Pose3)>>,

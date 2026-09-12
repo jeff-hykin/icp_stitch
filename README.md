@@ -11,8 +11,17 @@ Given a recording `.db` (memory2 sqlite store) it:
 3. selects keyframes, builds a factor graph (odometry betweens + tag landmark factors), solves with Levenberg-Marquardt (GTSAM)
 4. finds revisit pairs and adds point-to-plane ICP loop-closure factors, then re-solves
 5. writes the results back into the db: `<odom>_corrected`, `<lidar>_corrected`,
-   `tf_deformation_nodes_corrected`, `pose_graph`, accumulated raycast maps,
+   `tf_corrected`, `tf_deformation_nodes_corrected`, `pose_graph`, accumulated raycast maps,
    a `<lidar>_corrected.pc2.lcm` aggregate, and a `corrected_compare.rrd` rerun comparison
+
+`tf_corrected` is a near-duplicate of the recording's own tf tree: the localization edge is
+the corrected trajectory (`<world> -> <body>_corrected`) and everything below the body frame
+— every sensor mount, every camera — is copied verbatim onto `_corrected` frame names, so the
+corrected streams place through the usual tf chain instead of being baked into world. The
+per-scan `<lidar>_corrected` clouds therefore carry frame `<body>_corrected`; only the fused
+`*_accumulated` maps and the `.pc2.lcm` aggregate are world-baked (a single fused cloud has no
+tf to hang on). Both trees share the same `<world>` root, so raw and corrected are directly
+comparable in one viewer.
 
 ## Install
 
@@ -53,7 +62,8 @@ auto-detected; every stage can be overridden or disabled:
 --marker-length <M>          tag side length in meters (default 0.1)
 --dict <DICT>                tag dictionary (default DICT_APRILTAG_36h11)
 --ignore-tags <IDS>          comma-separated marker ids to skip
---corrected-suffix <SUF>     suffix for output streams (default _corrected)
+--corrected-suffix <SUF>     suffix for output streams and corrected frames (default _corrected)
+--corrected-odom-frame <F>   corrected body frame (default <body frame><corrected suffix>)
 --no-odom / --no-lidar       skip writing corrected odometry / lidar
 --no-icp                     tag PGO only, no ICP closures
 --no-lcm / --no-rrd / --no-accum   skip the .pc2.lcm / .rrd / accumulated maps

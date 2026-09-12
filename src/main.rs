@@ -23,6 +23,8 @@ Two-stage solve turns drifty odometry into a ground-truth trajectory:
      local geometry, then re-solve.
 
 Outputs written back into the recording db: <odom>_corrected, <lidar>_corrected,
+tf_corrected (a near-duplicate of the recorded tf tree driven by the corrected
+trajectory, so every corrected stream places through the usual tf chain),
 tf_deformation_nodes_corrected, pose_graph, and raycast-accumulated maps; plus an
 aggregated <lidar>_corrected.pc2.lcm and a comparison rrd opened in rerun.
 
@@ -89,8 +91,9 @@ struct Args {
     suffix: String,
     #[arg(long = "world-frame", default_value = "world")]
     world_frame: String,
-    /// child frame the corrected odom/lidar hang on (tf-driven, not world-baked)
-    #[arg(long = "corrected-odom-frame", default_value = "corrected_odom")]
+    /// child frame the corrected odom/lidar hang on, and the root of the duplicated
+    /// corrected tf tree (default '<body frame><corrected suffix>')
+    #[arg(long = "corrected-odom-frame", default_value = "")]
     corrected_odom_frame: String,
     /// 'parent:child' edge the odom overrides
     #[arg(long = "odom-tf", default_value = "")]
@@ -281,6 +284,13 @@ fn run(args: Args) -> Result<(), String> {
             .split_once(':')
             .map(|(_, child)| child.to_string())
             .ok_or_else(|| format!("--odom-tf must be 'parent:child', got '{odom_tf}'"))?
+    };
+    // the corrected tf tree mirrors the recorded one under these frame names
+    let frame_suffix = format!("{}{}", args.corrected_suffix, args.suffix);
+    let corrected_body_frame = if args.corrected_odom_frame.is_empty() {
+        format!("{body_frame}{frame_suffix}")
+    } else {
+        args.corrected_odom_frame.clone()
     };
     let ignore_tags: HashSet<i64> = args
         .ignore_tags
@@ -509,6 +519,7 @@ fn run(args: Args) -> Result<(), String> {
     )?;
 
     let corrected_odom_out = format!("{odom_stream}{}{}", args.corrected_suffix, args.suffix);
+    let corrected_tf_out = format!("tf{frame_suffix}");
     if args.write_odom {
         artifacts::write_corrected_odom(
             &connection,
@@ -517,7 +528,19 @@ fn run(args: Args) -> Result<(), String> {
             &keyframe_times,
             &corrections,
             &args.world_frame,
-            &args.corrected_odom_frame,
+            &corrected_body_frame,
+        )?;
+        artifacts::write_corrected_tf_tree(
+            &connection,
+            &corrected_tf_out,
+            &tf_samples,
+            &odom_rows,
+            &keyframe_times,
+            &corrections,
+            &args.world_frame,
+            &body_frame,
+            &corrected_body_frame,
+            &frame_suffix,
         )?;
     }
 
@@ -535,7 +558,7 @@ fn run(args: Args) -> Result<(), String> {
             lcm_path.as_deref(),
             args.lcm_voxel,
             &args.world_frame,
-            &args.corrected_odom_frame,
+            &corrected_body_frame,
         )?;
         if args.accum {
             artifacts::raycast_accumulate(
@@ -549,30 +572,14 @@ fn run(args: Args) -> Result<(), String> {
             )?;
             if memory2::list_streams(&connection)?
                 .iter()
-                .any(|s| s == &corrected_odom_out)
+                .any(|s| s == &corrected_tf_out)
             {
-                // tf that places the corrected-odom-framed per-scan clouds back into the
-                // world; also supplies the ray origin for the corrected raycast.
-                let corrected_odom_full =
-                    memory2::read_odometry(&connection, &corrected_odom_out, 1)?;
-                let mut corrected_store_tf = tf::RecordingTf::from_samples(&tf_samples);
-                let trajectory: Vec<(f64, Pose3)> = corrected_odom_full
-                    .iter()
-                    .map(|row| {
-                        (
-                            row.ts,
-                            Pose3 {
-                                rotation: row.rotation,
-                                translation: row.translation,
-                            },
-                        )
-                    })
-                    .collect();
-                corrected_store_tf.override_edge(
-                    &args.world_frame,
-                    &args.corrected_odom_frame,
-                    trajectory,
-                );
+                // the corrected tree places the corrected-framed per-scan clouds back into
+                // the world; it also supplies the ray origin for the corrected raycast.
+                let corrected_store_tf = tf::RecordingTf::from_samples(&memory2::read_tf(
+                    &connection,
+                    &corrected_tf_out,
+                )?);
                 let corrected_scans = memory2::read_scans(&connection, &lidar_out, 1)?;
                 artifacts::raycast_accumulate(
                     &connection,
@@ -585,7 +592,7 @@ fn run(args: Args) -> Result<(), String> {
                 )?;
             } else {
                 println!(
-                    "WARNING: no corrected odom stream (--no-odom?) -- skipping corrected lidar accumulation"
+                    "WARNING: no corrected tf tree (--no-odom?) -- skipping corrected lidar accumulation"
                 );
             }
         }

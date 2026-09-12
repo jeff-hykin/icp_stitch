@@ -17,7 +17,7 @@
 //! Faithful port of `gsc_pgo/utils/artifacts.py`, byte-compatible on the wire
 //! (same lcm blobs, same sqlite schema, same print strings).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -26,14 +26,16 @@ use lcm_msgs::geometry_msgs;
 use lcm_msgs::nav_msgs::Odometry;
 use lcm_msgs::sensor_msgs::{PointCloud2, PointField};
 use lcm_msgs::std_msgs;
+use lcm_msgs::tf2_msgs::TFMessage;
 use rusqlite::Connection;
 
-use crate::memory2::{self, ScanRow};
+use crate::memory2::{self, ScanRow, TfSample};
 use crate::msgs::{DeformationNode, Edge, Graph3D, Node3D, PoseStamped, tf_id_for};
 use crate::pgo::OdomPoseRow;
 use crate::pointcloud::KdTree;
 use crate::se3;
 use crate::tf::RecordingTf;
+use crate::tf::STATIC_POSE_TOLERANCE;
 use crate::voxel_ray_tracer::{self, Config as RayConfig, VoxelMap};
 
 // aggregated .pc2.lcm
@@ -47,6 +49,7 @@ const SCAN_LOG_EVERY: usize = 2000;
 
 pub(crate) const ODOMETRY_MODULE: &str = "dimos.msgs.nav_msgs.Odometry.Odometry";
 pub(crate) const POINTCLOUD2_MODULE: &str = "dimos.msgs.sensor_msgs.PointCloud2.PointCloud2";
+pub(crate) const TFMESSAGE_MODULE: &str = "dimos.msgs.tf2_msgs.TFMessage.TFMessage";
 const GRAPH3D_MODULE: &str = "dimos.navigation.jnav.msgs.Graph3D.Graph3D";
 const DEFORMATION_NODE_MODULE: &str = "dimos.navigation.jnav.msgs.DeformationNode.DeformationNode";
 
@@ -188,6 +191,32 @@ pub(crate) fn encode_odometry(
     message.encode()
 }
 
+/// One `TransformStamped` as a single-edge `TFMessage`, the shape a recorded tf stream
+/// carries (`pose` is x y z qx qy qz qw).
+fn encode_tf_edge(ts: f64, parent: &str, child: &str, pose: &[f64; 7]) -> Vec<u8> {
+    let [x, y, z, qx, qy, qz, qw] = *pose;
+    TFMessage {
+        transforms: vec![geometry_msgs::TransformStamped {
+            header: std_msgs::Header {
+                seq: 1,
+                stamp: ros_stamp(ts),
+                frame_id: parent.to_string(),
+            },
+            child_frame_id: child.to_string(),
+            transform: geometry_msgs::Transform {
+                translation: geometry_msgs::Vector3 { x, y, z },
+                rotation: geometry_msgs::Quaternion {
+                    x: qx,
+                    y: qy,
+                    z: qz,
+                    w: qw,
+                },
+            },
+        }],
+    }
+    .encode()
+}
+
 /// Per keyframe: the raw pose then the optimized pose, so tf.get can replay the correction.
 pub fn write_deformation_nodes(
     connection: &Connection,
@@ -282,8 +311,8 @@ pub fn write_pose_graph(
     Ok(())
 }
 
-/// Corrected trajectory as `world_frame -> corrected_odom_frame` odometry, i.e. the tf
-/// edge the per-scan corrected clouds hang on.
+/// Corrected trajectory as `world_frame -> corrected_body_frame` odometry, i.e. the
+/// localization edge of the corrected tf tree the per-scan corrected clouds hang on.
 pub fn write_corrected_odom(
     connection: &Connection,
     name: &str,
@@ -291,7 +320,7 @@ pub fn write_corrected_odom(
     keyframe_times: &[f64],
     corrections: &[Pose3],
     world_frame: &str,
-    corrected_odom_frame: &str,
+    corrected_body_frame: &str,
 ) -> Result<(), String> {
     if memory2::list_streams(connection)?.iter().any(|s| s == name) {
         memory2::delete_stream(connection, name)?;
@@ -305,7 +334,7 @@ pub fn write_corrected_odom(
         let corrected =
             se3::compose(&interpolate_correction(keyframe_times, corrections, ts), &raw);
         let tuple = se3::pose_tuple(&corrected);
-        let blob = encode_odometry(ts, world_frame, corrected_odom_frame, &tuple);
+        let blob = encode_odometry(ts, world_frame, corrected_body_frame, &tuple);
         memory2::append(connection, name, ts, Some(tuple), &[], &blob)?;
         if (count + 1) % ODOM_LOG_EVERY == 0 {
             println!(
@@ -320,6 +349,148 @@ pub fn write_corrected_odom(
         "wrote {name}: {} poses in {:.0}s",
         odom_rows.len(),
         started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Every frame below `root` in the recorded tree, walking parent -> child only so the
+/// localization edges above the body are never followed into the rest of the tree.
+fn frames_under(samples: &[TfSample], root: &str) -> BTreeSet<String> {
+    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for sample in samples {
+        children
+            .entry(sample.parent.as_str())
+            .or_default()
+            .push(sample.child.as_str());
+    }
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    found.insert(root.to_string());
+    let mut queue = vec![root.to_string()];
+    while let Some(frame) = queue.pop() {
+        for child in children.get(frame.as_str()).into_iter().flatten() {
+            if found.insert(child.to_string()) {
+                queue.push(child.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// `tf::edge_is_static` on raw samples: one sensor mount, published over and over.
+fn samples_are_static(samples: &[&TfSample]) -> bool {
+    let Some(first) = samples.first() else {
+        return true;
+    };
+    samples.iter().all(|sample| {
+        let translation_delta = (0..3)
+            .map(|i| (sample.translation[i] - first.translation[i]).abs())
+            .fold(0.0, f64::max);
+        let rotation_delta = (0..4)
+            .map(|i| (sample.quaternion_xyzw[i] - first.quaternion_xyzw[i]).abs())
+            .fold(0.0, f64::max);
+        translation_delta <= STATIC_POSE_TOLERANCE && rotation_delta <= STATIC_POSE_TOLERANCE
+    })
+}
+
+/// A near-duplicate of the recorded tf tree rooted on the corrected trajectory: one
+/// `world_frame -> corrected_body_frame` edge per odom sample, then every recorded edge
+/// below `body_frame` copied onto suffixed frame names, so the whole rig (every sensor
+/// mount, every camera) is placeable in corrected space through the same chain its raw
+/// counterpart uses. Static edges collapse to a single sample stamped at the start of the
+/// recording — tf latches past-only, and recorded mounts often start a fraction of a
+/// second late, which would leave the earliest scans unresolvable.
+#[allow(clippy::too_many_arguments)]
+pub fn write_corrected_tf_tree(
+    connection: &Connection,
+    name: &str,
+    tf_samples: &[TfSample],
+    odom_rows: &[OdomPoseRow],
+    keyframe_times: &[f64],
+    corrections: &[Pose3],
+    world_frame: &str,
+    body_frame: &str,
+    corrected_body_frame: &str,
+    frame_suffix: &str,
+) -> Result<(), String> {
+    if memory2::list_streams(connection)?.iter().any(|s| s == name) {
+        memory2::delete_stream(connection, name)?;
+    }
+    memory2::create_stream(connection, name, TFMESSAGE_MODULE)?;
+    let start_ts = tf_samples
+        .iter()
+        .map(|sample| sample.ts)
+        .chain(odom_rows.iter().map(|row| row[0]))
+        .fold(f64::INFINITY, f64::min);
+
+    // the localization edge: the corrected trajectory itself
+    for row in odom_rows {
+        let ts = row[0];
+        let raw = se3::from_xyzquat(&row[1..]);
+        let corrected = se3::compose(
+            &interpolate_correction(keyframe_times, corrections, ts),
+            &raw,
+        );
+        memory2::append(
+            connection,
+            name,
+            ts,
+            None,
+            &[("child_frame", corrected_body_frame.to_string())],
+            &encode_tf_edge(
+                ts,
+                world_frame,
+                corrected_body_frame,
+                &se3::pose_tuple(&corrected),
+            ),
+        )?;
+    }
+
+    // ...and the body's subtree verbatim, under suffixed names
+    let under = frames_under(tf_samples, body_frame);
+    let renamed = |frame: &str| {
+        if frame == body_frame {
+            corrected_body_frame.to_string()
+        } else {
+            format!("{frame}{frame_suffix}")
+        }
+    };
+    let mut edges: BTreeMap<(&str, &str), Vec<&TfSample>> = BTreeMap::new();
+    for sample in tf_samples {
+        if sample.parent != sample.child && under.contains(&sample.parent) {
+            edges
+                .entry((sample.parent.as_str(), sample.child.as_str()))
+                .or_default()
+                .push(sample);
+        }
+    }
+    let mut edge_rows = 0usize;
+    for ((parent, child), samples) in &edges {
+        let (parent, child) = (renamed(parent), renamed(child));
+        let stamped: Vec<(f64, &TfSample)> = if samples_are_static(samples) {
+            vec![(start_ts, samples[0])]
+        } else {
+            samples.iter().map(|sample| (sample.ts, *sample)).collect()
+        };
+        for (ts, sample) in stamped {
+            let [x, y, z] = sample.translation;
+            let [qx, qy, qz, qw] = sample.quaternion_xyzw;
+            memory2::append(
+                connection,
+                name,
+                ts,
+                None,
+                &[("child_frame", child.clone())],
+                &encode_tf_edge(ts, &parent, &child, &[x, y, z, qx, qy, qz, qw]),
+            )?;
+            edge_rows += 1;
+        }
+    }
+    println!(
+        "wrote {name}: {world_frame} -> {corrected_body_frame} ({} poses) \
+         + {} edge(s) below {body_frame} ({edge_rows} rows, {} frames)",
+        odom_rows.len(),
+        edges.len(),
+        under.len()
     );
     Ok(())
 }
@@ -444,9 +615,9 @@ fn remove_statistical_outlier(
     (out_points, out_intensities)
 }
 
-/// Per-scan corrected clouds into the db, stored body-relative on `corrected_odom_frame`
-/// so rerun/tf can place them via `<odom>_corrected`; if `lcm_path`, also one aggregated,
-/// world-baked .pc2.lcm (a single fused cloud has no tf to hang on).
+/// Per-scan corrected clouds into the db, stored body-relative on `corrected_body_frame`
+/// so rerun/tf can place them through the corrected tf tree; if `lcm_path`, also one
+/// aggregated, world-baked .pc2.lcm (a single fused cloud has no tf to hang on).
 #[allow(clippy::too_many_arguments)]
 pub fn write_corrected_lidar(
     connection: &Connection,
@@ -459,7 +630,7 @@ pub fn write_corrected_lidar(
     lcm_path: Option<&Path>,
     lcm_voxel: f64,
     world_frame: &str,
-    corrected_odom_frame: &str,
+    corrected_body_frame: &str,
 ) -> Result<(), String> {
     if memory2::list_streams(connection)?.iter().any(|s| s == name) {
         memory2::delete_stream(connection, name)?;
@@ -500,7 +671,7 @@ pub fn write_corrected_lidar(
         let blob = encode_pointcloud2(
             &body_points,
             scan.intensities.as_deref(),
-            corrected_odom_frame,
+            corrected_body_frame,
             ts,
         );
         let pose = se3::pose_tuple(&se3::compose(&correction, &raw_pose));
@@ -689,6 +860,17 @@ mod tests {
         Pose3::from_translation([x, y, z])
     }
 
+    fn tf_sample(ts: f64, parent: &str, child: &str, translation: [f64; 3]) -> TfSample {
+        TfSample {
+            ts,
+            parent: parent.to_string(),
+            child: child.to_string(),
+            translation,
+            quaternion_xyzw: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+
     #[test]
     fn interpolation_clamps_and_lerps() {
         let times = [0.0, 1.0];
@@ -855,5 +1037,96 @@ mod tests {
         assert_eq!(decoded.width, 0);
         assert_eq!(decoded.fields.len(), 4);
         std::fs::remove_file(&lcm_file).ok();
+    }
+
+    #[test]
+    fn corrected_tf_tree_mirrors_the_recorded_one() {
+        use crate::memory2::read_tf;
+        use crate::tf::RecordingTf;
+
+        let connection = Connection::open_in_memory().unwrap();
+        // recorded tree: a dynamic world -> base localization edge, a static sensor mount
+        // published late and repeatedly, and one more static frame below the sensor
+        let mut samples = vec![
+            tf_sample(0.0, "world", "base", [0.0, 0.0, 0.0]),
+            tf_sample(10.0, "world", "base", [1.0, 0.0, 0.0]),
+            tf_sample(5.0, "world", "other_robot", [7.0, 0.0, 0.0]),
+        ];
+        for ts in [0.5, 3.0, 9.0] {
+            samples.push(tf_sample(ts, "base", "lidar", [0.2, 0.0, 0.1]));
+            samples.push(tf_sample(ts, "lidar", "lidar_optical", [0.0, 0.0, 0.05]));
+        }
+        let times = [0.0, 10.0];
+        let corrections = [identity(), translation(0.5, 0.0, 0.0)];
+        let odom_rows: Vec<OdomPoseRow> = vec![
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [10.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ];
+        write_corrected_tf_tree(
+            &connection,
+            "tf_corrected",
+            &samples,
+            &odom_rows,
+            &times,
+            &corrections,
+            "world",
+            "base",
+            "base_corrected",
+            "_corrected",
+        )
+        .unwrap();
+
+        let written = read_tf(&connection, "tf_corrected").unwrap();
+        let edges: BTreeSet<(String, String)> = written
+            .iter()
+            .map(|sample| (sample.parent.clone(), sample.child.clone()))
+            .collect();
+        // the localization edge plus the body's subtree, nothing from the other branch
+        assert_eq!(
+            edges,
+            [
+                ("world", "base_corrected"),
+                ("base_corrected", "lidar_corrected"),
+                ("lidar_corrected", "lidar_optical_corrected"),
+            ]
+            .iter()
+            .map(|(parent, child)| (parent.to_string(), child.to_string()))
+            .collect()
+        );
+        // one row per odom pose on the localization edge; static mounts collapse to one
+        assert_eq!(written.len(), odom_rows.len() + 2);
+        // ...stamped at the start of the recording, not at their own late first sample
+        let mount = written
+            .iter()
+            .find(|sample| sample.child == "lidar_corrected")
+            .unwrap();
+        assert_eq!(mount.ts, 0.0);
+
+        // the whole chain resolves, and at the far end carries the correction
+        let tree = RecordingTf::from_samples(&written);
+        let pose = tree.get("world", "lidar_optical_corrected", 10.0).unwrap();
+        assert!((pose.translation[0] - (1.5 + 0.2)).abs() < 1e-9);
+        assert!((pose.translation[2] - 0.15).abs() < 1e-9);
+        // the earliest scan is placeable too (the late mount would have failed here)
+        assert!(tree.get("world", "lidar_corrected", 0.0).is_ok());
+
+        // re-running replaces the stream instead of accumulating a second copy
+        write_corrected_tf_tree(
+            &connection,
+            "tf_corrected",
+            &samples,
+            &odom_rows,
+            &times,
+            &corrections,
+            "world",
+            "base",
+            "base_corrected",
+            "_corrected",
+        )
+        .unwrap();
+        assert_eq!(
+            read_tf(&connection, "tf_corrected").unwrap().len(),
+            written.len()
+        );
     }
 }

@@ -54,7 +54,6 @@ const GO2_CORRECTED_ODOMETRY_STREAM_NAME: &str = "go2_odometry";
 const LOG_EVERY: usize = 5000;
 
 const POSE_STAMPED_MODULE: &str = "dimos.msgs.geometry_msgs.PoseStamped.PoseStamped";
-const TFMESSAGE_MODULE: &str = "dimos.msgs.tf2_msgs.TFMessage.TFMessage";
 
 /// `(odom_stream, lidar_stream)` defaults from what a recording actually has.
 pub fn resolve_streams(available: &[String], odom: &str, lidar: &str) -> (String, String) {
@@ -274,7 +273,7 @@ fn write_static_tf(connection: &Connection, stamp: f64, base_frame: &str) -> Res
         .iter()
         .any(|s| s == TF_STREAM)
     {
-        memory2::create_stream(connection, TF_STREAM, TFMESSAGE_MODULE)?;
+        memory2::create_stream(connection, TF_STREAM, artifacts::TFMESSAGE_MODULE)?;
     }
     let rows = read_raw_rows(connection, TF_STREAM)?;
     let mut kept = Vec::new();
@@ -296,7 +295,7 @@ fn write_static_tf(connection: &Connection, stamp: f64, base_frame: &str) -> Res
     }
     if stale > 0 {
         memory2::delete_stream(connection, TF_STREAM)?;
-        memory2::create_stream(connection, TF_STREAM, TFMESSAGE_MODULE)?;
+        memory2::create_stream(connection, TF_STREAM, artifacts::TFMESSAGE_MODULE)?;
         for row in &kept {
             memory2::append_raw(
                 connection,
