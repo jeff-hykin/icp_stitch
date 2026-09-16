@@ -1,0 +1,120 @@
+# Builds icp_stitch for the three platforms dtk knows how to fetch, and keeps a
+# release tagged `latest` pointing at them, so
+# https://github.com/jeff-hykin/icp_stitch/releases/latest/download/icp_stitch-<platform>
+# is always the newest build of main.
+#
+# Deliberately not nix, unlike the flake used for development: a nix-built binary
+# links against /nix/store paths and will not run on a machine without nix, which
+# is the whole point of publishing one. So gtsam is built here from the same
+# pinned revision the flake uses, but STATIC, and linked in whole.
+name: release
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+permissions:
+    contents: write
+
+env:
+    # same pin as flake.nix
+    GTSAM_REVISION: 1a9792a7ede244850a413739557635b606f295c0
+
+jobs:
+    build:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # 22.04 rather than latest so the binary needs only glibc 2.35,
+                    # which is what an Orin (L4T 36) and a Pi both already have.
+                    - runner: ubuntu-22.04
+                      asset: icp_stitch-x86_64-linux
+                    - runner: ubuntu-22.04-arm
+                      asset: icp_stitch-aarch64-linux
+                    - runner: macos-14
+                      asset: icp_stitch-aarch64-macos
+        runs-on: ${{ matrix.runner }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: cache the gtsam build
+              id: gtsam-cache
+              uses: actions/cache@v4
+              with:
+                  path: gtsam-install
+                  key: gtsam-${{ matrix.runner }}-${{ env.GTSAM_REVISION }}-static-v1
+
+            - name: build gtsam, static
+              if: steps.gtsam-cache.outputs.cache-hit != 'true'
+              run: |
+                  git clone https://github.com/borglab/gtsam.git gtsam-source
+                  git -C gtsam-source checkout "$GTSAM_REVISION"
+                  cmake -S gtsam-source -B gtsam-build \
+                      -DCMAKE_BUILD_TYPE=Release \
+                      -DCMAKE_INSTALL_PREFIX="$PWD/gtsam-install" \
+                      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+                      -DBUILD_SHARED_LIBS=OFF \
+                      -DGTSAM_WITH_TBB=OFF \
+                      -DGTSAM_USE_SYSTEM_EIGEN=OFF \
+                      -DGTSAM_USE_BOOST_FEATURES=OFF \
+                      -DGTSAM_ENABLE_BOOST_SERIALIZATION=OFF \
+                      -DGTSAM_BUILD_TESTS=OFF \
+                      -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
+                      -DGTSAM_BUILD_UNSTABLE=OFF \
+                      -DGTSAM_BUILD_DOCS=OFF \
+                      -DGTSAM_BUILD_PYTHON=OFF \
+                      -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF
+                  cmake --build gtsam-build --parallel "$(getconf _NPROCESSORS_ONLN)"
+                  cmake --install gtsam-build
+
+            - uses: dtolnay/rust-toolchain@stable
+
+            - name: build icp_stitch
+              env:
+                  GTSAM_INCLUDE_DIR: ${{ github.workspace }}/gtsam-install/include
+                  GTSAM_LIB_DIR: ${{ github.workspace }}/gtsam-install/lib
+                  # GTSAM_USE_SYSTEM_EIGEN=OFF installs gtsam's own Eigen here, so
+                  # the shim compiles against exactly the one gtsam was built with.
+                  EIGEN_INCLUDE_DIR: ${{ github.workspace }}/gtsam-install/include/gtsam/3rdparty/Eigen
+              run: |
+                  # gtsam's lib dir is lib on some layouts and lib64 on others
+                  if [ ! -d "$GTSAM_LIB_DIR" ]; then
+                      GTSAM_LIB_DIR="${{ github.workspace }}/gtsam-install/lib64"
+                      export GTSAM_LIB_DIR
+                  fi
+                  # Carry libstdc++ inside the binary too; a Jetson's is older than
+                  # the runner's and would otherwise be the one thing still missing.
+                  if [ "$RUNNER_OS" = "Linux" ]; then
+                      export RUSTFLAGS="-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
+                  fi
+                  cargo build --release --locked
+
+            - name: check it runs
+              run: ./target/release/icp_stitch --help
+
+            - run: install -m755 target/release/icp_stitch "${{ matrix.asset }}"
+
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ matrix.asset }}
+                  path: ${{ matrix.asset }}
+
+    release:
+        needs: build
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/download-artifact@v4
+              with:
+                  merge-multiple: true
+                  path: dist
+            - name: publish the `latest` release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  gh release delete latest --yes --cleanup-tag || true
+                  gh release create latest dist/* \
+                      --title "latest" \
+                      --notes "Built from ${{ github.sha }}"

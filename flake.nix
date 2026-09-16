@@ -21,7 +21,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "gtsam_shim-0.1.0" = "sha256-DqIrl6EJsgYfSbMXwbAOR+qT1RdeTx6fDomot1tdFBM=";
+              "gtsam_shim-0.1.0" = "sha256-DPG0WfdsNSJ8jOr2W1PAmvnuk3Mp3hgBf0Z6HHjqRg0=";
               "lcm-msgs-0.1.0" = "sha256-ps+8iBliZpyDB3I+QB5U+L+Jo5idP+GzuJBRnGoN9CU=";
             };
           };

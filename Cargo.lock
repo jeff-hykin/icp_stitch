@@ -1301,7 +1301,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 [[package]]
 name = "gtsam_shim"
 version = "0.1.0"
-source = "git+https://github.com/jeff-hykin/gtsam_shim#6990a10ac3a10476d6ccf8f2cf21441249854231"
+source = "git+https://github.com/jeff-hykin/gtsam_shim#515eedd05537eca887b0732397b2da6b8d8d9085"
 dependencies = [
  "cc",
 ]
