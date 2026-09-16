@@ -84,10 +84,14 @@ jobs:
                       GTSAM_LIB_DIR="${{ github.workspace }}/gtsam-install/lib64"
                       export GTSAM_LIB_DIR
                   fi
-                  # Carry libstdc++ inside the binary too; a Jetson's is older than
-                  # the runner's and would otherwise be the one thing still missing.
+                  # Carry libstdc++ inside the binary, so the only thing the target
+                  # still has to provide is glibc. Plain -static-libstdc++ does
+                  # nothing here: the cc crate emits its own `-lstdc++`, and the
+                  # linker takes the shared one for that. So silence the cc crate
+                  # (CXXSTDLIB) and ask for the archive explicitly instead.
                   if [ "$RUNNER_OS" = "Linux" ]; then
-                      export RUSTFLAGS="-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc"
+                      export CXXSTDLIB=""
+                      export RUSTFLAGS="-C link-arg=-Wl,-Bstatic -C link-arg=-lstdc++ -C link-arg=-Wl,-Bdynamic -C link-arg=-static-libgcc"
                   fi
                   cargo build --release --locked
 
