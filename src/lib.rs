@@ -8,6 +8,7 @@ pub mod msgs;
 pub mod pgo;
 pub mod pointcloud;
 pub mod recording;
+#[cfg(feature = "rrd")]
 pub mod rrd;
 pub mod se3;
 pub mod tf;

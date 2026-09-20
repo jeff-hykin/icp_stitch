@@ -2,7 +2,7 @@
 //! matching gtsam's Pose3 Expmap/Logmap conventions (tangent = [omega, v]).
 
 use crate::mat3::{self, Mat3, Vec3};
-use gtsam_shim::Pose3;
+pub use gtsam_shim::Pose3;
 
 pub fn from_xyzquat(row: &[f64]) -> Pose3 {
     // input is xyzw; mat_from_quat wants wxyz

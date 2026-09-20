@@ -596,6 +596,7 @@ fn run(args: Args) -> Result<(), String> {
                 );
             }
         }
+        #[cfg(feature = "rrd")]
         if args.rrd {
             icp_stitch::rrd::build_and_open_rrd(
                 &connection,
@@ -607,6 +608,10 @@ fn run(args: Args) -> Result<(), String> {
                 &args.camera,
                 &args.camera_info_stream,
             )?;
+        }
+        #[cfg(not(feature = "rrd"))]
+        if args.rrd {
+            println!("WARNING: this build has no rerun support (feature `rrd`), so no .rrd was written");
         }
     }
     Ok(())

@@ -665,7 +665,7 @@ pub fn detect_raw_detections(
         .map_err(|e| e.to_string())?;
     let mut raw_detections = Vec::new();
     let mut image_count = 0usize;
-    let mut decoder: Option<(AprilTagDecoder, ImageSize)> = None;
+    let mut detector = TagDetector::from_kind(kind);
     for row in rows {
         let (ts, data) = row.map_err(|e| e.to_string())?;
         image_count += 1;
@@ -676,22 +676,60 @@ pub fn detect_raw_detections(
         let Ok((gray, width, height)) = decode_gray(&message) else {
             continue;
         };
+        let speed = speed_by_ts.get(&ts.to_bits()).copied().unwrap_or((-1.0, -1.0));
+        raw_detections.extend(detector.detect(ts, &gray, width, height, camera, marker_length, speed)?);
+    }
+    Ok((raw_detections, speed_available, image_count))
+}
+
+/// Tag detection on greyscale frames handed over one at a time, for a caller
+/// whose images do not live in a memory2 db. Keeps the AprilTag decoder
+/// between frames and rebuilds it only when the frame size changes.
+pub struct TagDetector {
+    kind: TagFamilyKind,
+    decoder: Option<(AprilTagDecoder, ImageSize)>,
+}
+
+impl TagDetector {
+    pub fn new(dictionary: &str) -> Result<TagDetector, String> {
+        Ok(TagDetector::from_kind(family_kind(dictionary)?))
+    }
+
+    fn from_kind(kind: TagFamilyKind) -> TagDetector {
+        TagDetector { kind, decoder: None }
+    }
+
+    /// Every tag in one frame, posed with `camera` and `marker_length`.
+    /// `speed` is the rig's (linear, angular) speed at `ts`, or (-1, -1) when
+    /// unknown; it only annotates the detection for the glimpse gates.
+    pub fn detect(
+        &mut self,
+        ts: f64,
+        gray: &[u8],
+        width: usize,
+        height: usize,
+        camera: &CameraModel,
+        marker_length: f64,
+        speed: (f64, f64),
+    ) -> Result<Vec<Detection>, String> {
         let size = ImageSize { width, height };
-        let needs_new = decoder
+        let needs_new = self
+            .decoder
             .as_ref()
             .is_none_or(|(_, existing)| existing.width != width || existing.height != height);
         if needs_new {
-            let config = DecodeTagsConfig::new(vec![kind.clone()]);
-            decoder = Some((
+            let config = DecodeTagsConfig::new(vec![self.kind.clone()]);
+            self.decoder = Some((
                 AprilTagDecoder::new(config, size).map_err(|e| e.to_string())?,
                 size,
             ));
         }
-        let (active_decoder, _) = decoder.as_mut().unwrap();
-        let kornia_image = KorniaImage::<u8, 1, CpuAllocator>::new(size, gray.clone(), CpuAllocator)
+        let (active_decoder, _) = self.decoder.as_mut().unwrap();
+        let kornia_image = KorniaImage::<u8, 1, CpuAllocator>::new(size, gray.to_vec(), CpuAllocator)
             .map_err(|e| e.to_string())?;
         let found = active_decoder.decode(&kornia_image).map_err(|e| e.to_string())?;
         active_decoder.clear();
+        let mut detections = Vec::new();
         for tag in &found {
             let corners = oriented_corners(tag);
             let Some((rotation, translation, reproj_px)) =
@@ -710,23 +748,21 @@ pub fn detect_raw_detections(
                 qw,
             ];
             let (distance_m, view_angle_deg) = view_quality(&t_cam_marker);
-            let (lin_speed, ang_speed) =
-                speed_by_ts.get(&ts.to_bits()).copied().unwrap_or((-1.0, -1.0));
-            raw_detections.push(Detection {
+            detections.push(Detection {
                 ts,
                 marker_id: tag.id as i64,
                 t_cam_marker,
-                sharpness: tag_sharpness(&gray, width, height, &corners),
+                sharpness: tag_sharpness(gray, width, height, &corners),
                 reproj_px,
                 tag_px: tag_pixel_size(&corners),
                 distance_m,
                 view_angle_deg,
-                lin_speed,
-                ang_speed,
+                lin_speed: speed.0,
+                ang_speed: speed.1,
             });
         }
+        Ok(detections)
     }
-    Ok((raw_detections, speed_available, image_count))
 }
 
 // ---- tag stream persistence ----------------------------------------------------

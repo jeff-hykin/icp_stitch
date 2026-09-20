@@ -23,5 +23,11 @@ serde_json = "1"
 kornia-apriltag = "0.1.10"
 kornia-image = "0.1.10"
 zune-jpeg = "0.5.15"
-rerun = { version = "0.32", default-features = false, features = ["sdk"] }
+rerun = { version = "0.32", default-features = false, features = ["sdk"], optional = true }
 lz4_flex = "0.11"
+
+[features]
+default = ["rrd"]
+# The rerun comparison (.rrd) and the SDK it needs; off when icp_stitch is a
+# library inside another tool that has no use for it.
+rrd = ["dep:rerun"]
