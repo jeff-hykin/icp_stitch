@@ -1,6 +1,7 @@
-//! Whole-recording tf lookup, mirroring dimos' `RecordingTF`: every edge of the
-//! recorded `tf` stream is buffered once, each lookup latches the newest sample
-//! at-or-before the query time (never a future one), and chains are resolved by
+//! Whole-recording tf lookup, like dimos' `RecordingTF` but interpolated: every edge of the
+//! recorded `tf` stream is buffered once, each lookup interpolates between the
+//! samples around the query time (latching the last one past the end, nothing
+//! before the first), and chains are resolved by
 //! BFS over the undirected frame graph. An optional edge override replaces the
 //! recorded localization (all time-varying edges) with a fed trajectory while
 //! keeping static edges (sensor mounts).
@@ -84,14 +85,27 @@ impl RecordingTf {
             .contains_key(&(parent.to_string(), child.to_string()))
     }
 
-    /// Newest sample at-or-before `ts` on one recorded edge.
+    /// One recorded edge at `ts`: interpolated between the samples around it (position
+    /// lerp, rotation slerp), latching the newest one past the end, None before the start.
     fn latch(&self, parent: &str, child: &str, ts: f64) -> Option<Pose3> {
         let samples = self.edges.get(&(parent.to_string(), child.to_string()))?;
         let index = samples.partition_point(|(sample_ts, _)| *sample_ts <= ts);
         if index == 0 {
             return None;
         }
-        Some(samples[index - 1].1.clone())
+        let (before_ts, before) = &samples[index - 1];
+        let Some((after_ts, after)) = samples.get(index) else {
+            return Some(before.clone());
+        };
+        let alpha = (ts - before_ts) / (after_ts - before_ts);
+        let relative = mat3::mat_mul(&mat3::transpose(&before.rotation), &after.rotation);
+        let step = se3::so3_log(&relative).map(|component| component * alpha);
+        Some(Pose3 {
+            rotation: mat3::mat_mul(&before.rotation, &se3::so3_exp(&step)),
+            translation: std::array::from_fn(|axis| {
+                before.translation[axis] + alpha * (after.translation[axis] - before.translation[axis])
+            }),
+        })
     }
 
     fn step(&self, from: &str, to: &str, ts: f64) -> Option<Pose3> {
@@ -170,18 +184,18 @@ mod tests {
     }
 
     #[test]
-    fn chains_and_latches_past_only() {
+    fn chains_and_interpolates() {
         let tf = RecordingTf::from_samples(&[
             sample(0.0, "world", "odom", [1.0, 0.0, 0.0]),
             sample(0.0, "odom", "base", [0.0, 1.0, 0.0]),
             sample(5.0, "odom", "base", [0.0, 2.0, 0.0]),
         ]);
         let early = tf.get("world", "base", 1.0).unwrap();
-        assert_eq!(early.translation, [1.0, 1.0, 0.0]);
+        assert!((early.translation[1] - 1.2).abs() < 1e-12, "{:?}", early.translation);
         let late = tf.get("world", "base", 10.0).unwrap();
         assert_eq!(late.translation, [1.0, 2.0, 0.0]);
         assert!(tf.get("world", "base", -1.0).is_err());
-        let inverse = tf.get("base", "world", 1.0).unwrap();
+        let inverse = tf.get("base", "world", 0.0).unwrap();
         assert_eq!(inverse.translation, [-1.0, -1.0, 0.0]);
     }
 
