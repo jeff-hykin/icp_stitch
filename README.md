@@ -97,7 +97,9 @@ icp_stitch --recording path/to/recording.mcap
 - Outputs are appended in place as new topics (`/pointlio_odometry_corrected`,
   `/tf_corrected`, ...): new chunks go where the data section ended and a fresh summary
   follows them, so the cost is the size of the outputs, never of the recording. A re-run
-  removes the previous run's outputs first and gives their space back. If a run fails or
+  removes the previous run's outputs first and gives their space back; only topics icp_stitch wrote
+  (`written_by: icp_stitch`) are ever removed, so a recorded topic with an output's name stops the run (pick other
+  names with `--suffix`). If a run fails or
   is interrupted (error, panic, SIGINT/SIGTERM/SIGHUP), the last summary is put back and
   the file reads as it did.
 - Outputs are written as **ROS 2 CDR with ros2msg schemas**, so Foxglove and any ROS 2

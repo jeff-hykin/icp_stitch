@@ -44,6 +44,10 @@ const DEFORMATION_NODE_MODULE: &str = "dimos.navigation.jnav.msgs.DeformationNod
 const MAP_BUILDER_GENERATION: &str = "map_builder_generation";
 const MAP_BUILDER_EDGE: &str = "map_builder_edge";
 
+/// Every output channel says who wrote it; only those are ever removed.
+const WRITTEN_BY: &str = "written_by";
+const WRITER: &str = "icp_stitch";
+
 /// Flush an output's buffered messages into a chunk at about this size.
 const CHUNK_TARGET: usize = 4 << 20;
 /// How far a header stamp may sit from its log time when windowing by log time.
@@ -694,12 +698,16 @@ impl McapStore {
 
     // ---- writing ----
 
+    /// Removes the channels of `names` that icp_stitch wrote (`written_by`); a recorded topic of the same name is
+    /// left alone, and writing that output then fails (`create`).
     fn remove(&self, names: &[String]) -> Result<(), String> {
         self.flush()?;
         let mut ids = HashSet::new();
         for name in names {
             self.outputs.borrow_mut().remove(name);
-            ids.extend(self.channels(name).into_iter().map(|(id, _)| id));
+            let file = self.file.borrow();
+            let ours = |id: &u16| file.summary.channels.get(id).and_then(|c| c.meta(WRITTEN_BY)) == Some(WRITER);
+            ids.extend(self.channels(name).into_iter().map(|(id, _)| id).filter(ours));
         }
         self.file.borrow_mut().remove_channels(&ids)
     }
@@ -707,7 +715,10 @@ impl McapStore {
     fn create(&self, name: &str, module: &str) -> Result<(), String> {
         self.flush()?;
         if !self.channels(name).is_empty() {
-            return Err(format!("'{name}' is already a topic in this recording; remove it before writing it"));
+            return Err(format!(
+                "'{name}' is already a topic in this recording that icp_stitch didn't write; it is left as it is: \
+                 name the outputs differently with --suffix"
+            ));
         }
         let output = Output { module: module.to_string(), channel: None, records: Vec::new(), entries: Vec::new(), sequence: 0 };
         self.outputs.borrow_mut().insert(name.to_string(), output);
@@ -724,7 +735,7 @@ impl McapStore {
             schema_id,
             topic: format!("/{name}"),
             message_encoding: "cdr".into(),
-            metadata: vec![("written_by".into(), "icp_stitch".into())],
+            metadata: vec![(WRITTEN_BY.into(), WRITER.into())],
         })
     }
 
@@ -907,6 +918,24 @@ mod tests {
         assert_eq!(rows.iter().map(|r| (r.ts, r.translation[0])).collect::<Vec<_>>(), vec![(1.0, 1.0), (2.0, 2.0)]);
         assert_eq!((rows[0].frame_id.as_str(), rows[0].child_frame_id.as_str()), ("odom", "body"));
         assert!(memory2::odometry_from_tf(&store, "odom:nothing").is_err());
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// a re-run replaces icp_stitch's own outputs but never a recorded topic of the same name
+    #[test]
+    fn only_outputs_icp_stitch_wrote_are_removed() {
+        let dir = std::env::temp_dir().join(format!("icp_stitch_foreign_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.mcap");
+        crate::mcap::tests::tiny_mcap(&path);
+        add_channel(&path, "/odom_corrected", vec![], &[(1.0, Odometry::default().encode())]);
+        add_channel(&path, "/pose_graph", vec![(WRITTEN_BY.into(), WRITER.into())], &[(1.0, Odometry::default().encode())]);
+        let store = Store::open(&path).unwrap();
+        store.prepare_outputs(&["odom_corrected".into(), "pose_graph".into()]).unwrap();
+        assert!(store.has_stream("odom_corrected").unwrap());
+        assert!(!store.has_stream("pose_graph").unwrap());
+        assert!(store.create_stream("odom_corrected", ODOMETRY_MODULE).unwrap_err().contains("--suffix"));
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
