@@ -14,14 +14,14 @@ use kornia_image::allocator::CpuAllocator;
 use kornia_image::{Image as KorniaImage, ImageSize};
 use lcm_msgs::sensor_msgs::{CameraInfo, Image as LcmImage};
 use lcm_msgs::{geometry_msgs, std_msgs};
-use rusqlite::Connection;
+use crate::memory2::Rows;
+use crate::store::Store;
 use rusqlite::types::Value;
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::bytestream::ZCursor;
 
 use crate::apriltags::{Detection, view_quality};
 use crate::mat3::{self, Mat3, Vec3};
-use crate::memory2;
 
 const POSE_STAMPED_MODULE: &str = "dimos.msgs.geometry_msgs.PoseStamped.PoseStamped";
 const UNDISTORT_ITERATIONS: usize = 5;
@@ -152,35 +152,18 @@ impl CameraModel {
     }
 }
 
-fn quote_ident(name: &str) -> Result<String, String> {
-    if name.contains('"') {
-        return Err(format!("illegal stream name {name:?}"));
-    }
-    Ok(format!("\"{name}\""))
-}
-
 /// First CameraInfo of `stream_name` as `(model, optical frame_id)`, or None
 /// when the stream is absent or empty (python `read_camera_info`).
 pub fn read_camera_info(
-    connection: &Connection,
+    store: &Store,
     stream_name: &str,
 ) -> Result<Option<(CameraModel, String)>, String> {
-    if !memory2::list_streams(connection)?.iter().any(|s| s == stream_name) {
+    if !store.list_streams()?.iter().any(|s| s == stream_name) {
         return Ok(None);
     }
-    let table = quote_ident(stream_name)?;
-    let blob_table = quote_ident(&format!("{stream_name}_blob"))?;
-    let sql = format!(
-        "SELECT blob.data FROM {table} AS meta \
-         JOIN {blob_table} AS blob ON meta.id = blob.id ORDER BY meta.ts LIMIT 1"
-    );
-    let mut statement = connection.prepare(&sql).map_err(|e| e.to_string())?;
-    let mut rows = statement.query([]).map_err(|e| e.to_string())?;
-    let Some(row) = rows.next().map_err(|e| e.to_string())? else {
+    let Some((_, data)) = store.first_blob(stream_name) else {
         return Ok(None);
     };
-    let data: Vec<u8> = row.get(0).map_err(|e| e.to_string())?;
-    let data = crate::memory2::decompress_if_lz4(data);
     let info = CameraInfo::decode(&data).map_err(|e| e.to_string())?;
     Ok(Some((
         CameraModel::from_info(&info.K, &info.D, &info.distortion_model),
@@ -192,7 +175,7 @@ pub fn read_camera_info(
 /// their intrinsics after the image stream (`<camera>_camera_info`) resolve
 /// before the generic `camera_info`.
 pub fn resolve_camera_info(
-    connection: &Connection,
+    store: &Store,
     camera_stream: &str,
     override_stream: &str,
 ) -> Result<(Option<(CameraModel, String)>, Vec<String>), String> {
@@ -202,7 +185,7 @@ pub fn resolve_camera_info(
         vec![override_stream.to_string()]
     };
     for stream_name in &tried {
-        if let Some(found) = read_camera_info(connection, stream_name)? {
+        if let Some(found) = read_camera_info(store, stream_name)? {
             return Ok((Some(found), tried));
         }
     }
@@ -562,36 +545,10 @@ pub fn tag_sharpness(gray: &[u8], width: usize, height: usize, corners: &[[f64; 
 /// posed rows of the image stream's meta table. Second value is false when too
 /// few frames carry poses to estimate motion (speed gates disabled).
 fn camera_speeds(
-    connection: &Connection,
+    store: &Store,
     image_stream: &str,
 ) -> Result<(HashMap<u64, (f64, f64)>, bool), String> {
-    let table = quote_ident(image_stream)?;
-    let sql = format!(
-        "SELECT ts, pose_x, pose_y, pose_z, pose_qx, pose_qy, pose_qz, pose_qw \
-         FROM {table} ORDER BY ts"
-    );
-    let mut statement = connection.prepare(&sql).map_err(|e| e.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            let ts: f64 = row.get(0)?;
-            let mut pose = [0.0; 7];
-            let mut complete = true;
-            for (index, slot) in pose.iter_mut().enumerate() {
-                match row.get::<_, Option<f64>>(index + 1)? {
-                    Some(value) => *slot = value,
-                    None => complete = false,
-                }
-            }
-            Ok((ts, complete.then_some(pose)))
-        })
-        .map_err(|e| e.to_string())?;
-    let mut posed: Vec<(f64, [f64; 7])> = Vec::new();
-    for row in rows {
-        let (ts, pose) = row.map_err(|e| e.to_string())?;
-        if let Some(pose) = pose {
-            posed.push((ts, pose));
-        }
-    }
+    let mut posed = store.row_poses(image_stream)?;
     posed.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut speeds = HashMap::new();
     for pair in posed.windows(2) {
@@ -641,43 +598,26 @@ fn oriented_corners(detection: &kornia_apriltag::decoder::Detection) -> [[f64; 2
 /// Every valid-PnP tag detection over `image_stream`, unfiltered, with gate
 /// diagnostics: `(detections, speed gate available, image count)`.
 pub fn detect_raw_detections(
-    connection: &Connection,
+    store: &Store,
     camera: &CameraModel,
     image_stream: &str,
     marker_length: f64,
     dictionary: &str,
 ) -> Result<(Vec<Detection>, bool, usize), String> {
     let kind = family_kind(dictionary)?;
-    let (speed_by_ts, speed_available) = camera_speeds(connection, image_stream)?;
-    let table = quote_ident(image_stream)?;
-    let blob_table = quote_ident(&format!("{image_stream}_blob"))?;
-    let sql = format!(
-        "SELECT meta.ts, blob.data FROM {table} AS meta \
-         JOIN {blob_table} AS blob ON meta.id = blob.id ORDER BY meta.ts"
-    );
-    let mut statement = connection.prepare(&sql).map_err(|e| e.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            let ts: f64 = row.get(0)?;
-            let data: Vec<u8> = row.get(1)?;
-            Ok((ts, data))
-        })
-        .map_err(|e| e.to_string())?;
-    let mut raw_detections = Vec::new();
+    let (speed_by_ts, speed_available) = camera_speeds(store, image_stream)?;
     let mut image_count = 0usize;
     let mut detector = TagDetector::from_kind(kind);
-    for row in rows {
-        let (ts, data) = row.map_err(|e| e.to_string())?;
+    let per_image = store.read_stream(image_stream, 1, |ts, data| {
         image_count += 1;
-        let data = crate::memory2::decompress_if_lz4(data);
-        let Ok(message) = LcmImage::decode(&data) else {
-            continue;
-        };
-        let Ok((gray, width, height)) = decode_gray(&message) else {
-            continue;
-        };
+        let message = LcmImage::decode(data).ok()?;
+        let (gray, width, height) = decode_gray(&message).ok()?;
         let speed = speed_by_ts.get(&ts.to_bits()).copied().unwrap_or((-1.0, -1.0));
-        raw_detections.extend(detector.detect(ts, &gray, width, height, camera, marker_length, speed)?);
+        Some(detector.detect(ts, &gray, width, height, camera, marker_length, speed))
+    })?;
+    let mut raw_detections = Vec::new();
+    for detections in per_image {
+        raw_detections.extend(detections?);
     }
     Ok((raw_detections, speed_available, image_count))
 }
@@ -800,15 +740,15 @@ fn encode_pose_stamped(ts: f64, pose: &[f64; 7]) -> Vec<u8> {
 /// (Re)write a PoseStamped tag stream, with the numeric gate-diagnostic tags
 /// when `diagnostics` (python `_write_tag_stream`).
 pub fn write_tag_stream(
-    connection: &Connection,
+    store: &Store,
     stream_name: &str,
     detections: &[Detection],
     diagnostics: bool,
 ) -> Result<(), String> {
-    if memory2::list_streams(connection)?.iter().any(|s| s == stream_name) {
-        memory2::delete_stream(connection, stream_name)?;
+    if store.list_streams()?.iter().any(|s| s == stream_name) {
+        store.delete_stream(stream_name)?;
     }
-    memory2::create_stream(connection, stream_name, POSE_STAMPED_MODULE)?;
+    store.create_stream(stream_name, POSE_STAMPED_MODULE)?;
     for detection in detections {
         let pose = detection.t_cam_marker;
         let mut tags: Vec<(&str, String)> = vec![("marker_id", detection.marker_id.to_string())];
@@ -825,9 +765,7 @@ pub fn write_tag_stream(
                 ("ang_speed", format!("{:?}", if speed_known { detection.ang_speed } else { -1.0 })),
             ]);
         }
-        memory2::append_json_tags(
-            connection,
-            stream_name,
+        store.append_json_tags(stream_name,
             detection.ts,
             Some(pose),
             &tags,
@@ -853,37 +791,13 @@ fn tag_number(value: Value, key: &str) -> Result<Option<f64>, String> {
 /// Read a persisted raw tag stream back into `Detection`s
 /// (python `read_raw_tag_stream`).
 pub fn read_raw_tag_stream(
-    connection: &Connection,
+    store: &Store,
     stream_name: &str,
 ) -> Result<Vec<Detection>, String> {
-    let table = quote_ident(stream_name)?;
-    let blob_table = quote_ident(&format!("{stream_name}_blob"))?;
-    let keys = ["marker_id", "sharpness", "reproj_px", "tag_px", "lin_speed", "ang_speed"];
-    let tag_columns: Vec<String> = keys
-        .iter()
-        .map(|key| format!("json_extract(meta.tags, '$.{key}')"))
-        .collect();
-    let sql = format!(
-        "SELECT meta.ts, blob.data, {} FROM {table} AS meta \
-         JOIN {blob_table} AS blob ON meta.id = blob.id ORDER BY meta.ts",
-        tag_columns.join(", ")
-    );
-    let mut statement = connection.prepare(&sql).map_err(|e| e.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            let ts: f64 = row.get(0)?;
-            let data: Vec<u8> = row.get(1)?;
-            let mut tag_values = Vec::with_capacity(keys.len());
-            for index in 0..keys.len() {
-                tag_values.push(row.get::<_, Value>(index + 2)?);
-            }
-            Ok((ts, data, tag_values))
-        })
-        .map_err(|e| e.to_string())?;
+    let keys = crate::store::TAG_KEYS;
+    let rows = store.read_tag_rows(stream_name)?;
     let mut detections = Vec::new();
-    for row in rows {
-        let (ts, data, tag_values) = row.map_err(|e| e.to_string())?;
-        let data = crate::memory2::decompress_if_lz4(data);
+    for (ts, data, tag_values) in rows {
         let message = lcm_msgs::geometry_msgs::PoseStamped::decode(&data)
             .map_err(|e| format!("{stream_name}: {e}"))?;
         let mut numbers = [None; 6];
@@ -924,14 +838,14 @@ pub fn read_raw_tag_stream(
 /// Detect + persist the unfiltered tag stream when absent; returns whether it
 /// exists (python `ensure_raw_tag_stream`).
 pub fn ensure_raw_tag_stream(
-    connection: &Connection,
+    store: &Store,
     camera: Option<&CameraModel>,
     raw_stream: &str,
     image_stream: &str,
     marker_length: f64,
     dictionary: &str,
 ) -> Result<bool, String> {
-    let streams = memory2::list_streams(connection)?;
+    let streams = store.list_streams()?;
     if streams.iter().any(|s| s == raw_stream) {
         return Ok(true);
     }
@@ -946,8 +860,8 @@ pub fn ensure_raw_tag_stream(
          (tag_size={marker_length:?} m, dict={dictionary})..."
     );
     let (raw_detections, _, image_count) =
-        detect_raw_detections(connection, camera, image_stream, marker_length, dictionary)?;
-    write_tag_stream(connection, raw_stream, &raw_detections, true)?;
+        detect_raw_detections(store, camera, image_stream, marker_length, dictionary)?;
+    write_tag_stream(store, raw_stream, &raw_detections, true)?;
     println!(
         "wrote {raw_stream}: {} detections over {image_count} images",
         raw_detections.len()
@@ -958,6 +872,7 @@ pub fn ensure_raw_tag_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use kornia_apriltag::family::TagFamily;
 
     fn test_camera() -> CameraModel {
@@ -1123,7 +1038,8 @@ mod tests {
 
     #[test]
     fn tag_stream_write_read_roundtrip() {
-        let connection = Connection::open_in_memory().unwrap();
+        let store = Store::Db(Connection::open_in_memory().unwrap());
+        let connection = store.connection().unwrap();
         let detections = vec![
             Detection {
                 ts: 10.5,
@@ -1150,7 +1066,7 @@ mod tests {
                 ang_speed: -1.0,
             },
         ];
-        write_tag_stream(&connection, "raw_april_tags", &detections, true).unwrap();
+        write_tag_stream(&store, "raw_april_tags", &detections, true).unwrap();
         // numeric tag types in the stored JSON, python-style
         let marker_type: String = connection
             .query_row(
@@ -1161,7 +1077,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(marker_type, "integer");
-        let back = read_raw_tag_stream(&connection, "raw_april_tags").unwrap();
+        let back = read_raw_tag_stream(&store, "raw_april_tags").unwrap();
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].marker_id, 3);
         assert!((back[0].sharpness - 120.0).abs() < 1e-12);
@@ -1170,8 +1086,8 @@ mod tests {
         assert_eq!(back[1].lin_speed, -1.0);
         assert_eq!(back[1].ang_speed, -1.0);
         // ensure() sees the stream and leaves it alone
-        assert!(ensure_raw_tag_stream(&connection, None, "raw_april_tags", "color_image", 0.1, "DICT_APRILTAG_36h11").unwrap());
+        assert!(ensure_raw_tag_stream(&store, None, "raw_april_tags", "color_image", 0.1, "DICT_APRILTAG_36h11").unwrap());
         // absent stream + no camera -> false
-        assert!(!ensure_raw_tag_stream(&connection, None, "other_tags", "color_image", 0.1, "DICT_APRILTAG_36h11").unwrap());
+        assert!(!ensure_raw_tag_stream(&store, None, "other_tags", "color_image", 0.1, "DICT_APRILTAG_36h11").unwrap());
     }
 }

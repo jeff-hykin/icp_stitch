@@ -50,7 +50,7 @@ icp_stitch --db path/to/recording.db
 auto-detected; every stage can be overridden or disabled:
 
 ```text
---db <DB>                    recording db path
+--recording <PATH>           the .db or .mcap (alias --db)
 --odom <ODOM>                odometry stream (auto-detected)
 --lidar <LIDAR>              lidar stream (auto-detected)
 --tags <TAGS>                raw AprilTag stream (default raw_april_tags)
@@ -72,9 +72,39 @@ auto-detected; every stage can be overridden or disabled:
 Plus a `solve tuning` group exposing every solver constant (`--keyframe-spacing-m`,
 `--icp-radius-m`, `--icp-fitness-min`, `--closure-spacing`, ...); see `icp_stitch --help`.
 
-The corrected streams are written back into the same db (only derived streams are
-added — the recording itself is never modified), so the run is repeatable and the
+The corrected streams are written back into the same recording (only derived streams are
+added — the recorded streams are never modified), so the run is repeatable and the
 outputs are regenerable.
+
+## .mcap recordings
+
+`--recording` (alias `--db`) also takes an `.mcap`, with the same options and outputs:
+
+```sh
+icp_stitch --recording path/to/recording.mcap
+```
+
+- Inputs may be ROS 2 CDR (`tf2_msgs/msg/TFMessage`, `nav_msgs/msg/Odometry`,
+  `sensor_msgs/msg/PointCloud2`, `CameraInfo`, `Image`, `CompressedImage`) or dimos LCM
+  (schema-less, known by the fingerprint at the start of each message). A stream name
+  matches a topic with or without its leading slash, or as `dtk mcap_to_db` names it
+  (`/realsense/color_image/camera_info` is `realsense_color_image_camera_info`), so the
+  same command line works on a recording and on its `.db` conversion. `tf` also reads
+  `/tf_static`. Channels come from the summary, and a topic on several channel ids is
+  read across all of them.
+- Outputs are appended in place as new topics (`/pointlio_odometry_corrected`,
+  `/tf_corrected`, ...): new chunks go where the data section ended and a fresh summary
+  follows them, so the cost is the size of the outputs, never of the recording. A re-run
+  removes the previous run's outputs first and gives their space back. If a run fails or
+  is interrupted (error, panic, SIGINT/SIGTERM/SIGHUP), the last summary is put back and
+  the file reads as it did.
+- Outputs are written as **ROS 2 CDR with ros2msg schemas**, so Foxglove and any ROS 2
+  tool read them next to the raw topics without a conversion step (schema-less LCM
+  channels are readable only by dimos). The dimos-only types are given ros2msg schemas
+  of their own: `dimos_msgs/msg/Graph3D` (`pose_graph`), `dimos_msgs/msg/DeformationNode`
+  (`tf_deformation_nodes_corrected`) and `dimos_msgs/msg/AprilTagDetection`
+  (`raw_april_tags`, carrying the gate diagnostics a `.db` keeps in row tags).
+- go2-legacy (bare `PoseStamped` odometry) recordings still need a `.db`.
 
 ## Helpers
 

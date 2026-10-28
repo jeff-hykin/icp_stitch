@@ -9,7 +9,7 @@ use std::process::Command;
 use gtsam_shim::Pose3;
 use kornia_apriltag::family::TagFamily;
 use lcm_msgs::sensor_msgs::Image as LcmImage;
-use rusqlite::Connection;
+use crate::store::Store;
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::bytestream::ZCursor;
 
@@ -192,8 +192,8 @@ fn cluster_medoid(cluster: &[&Detection]) -> usize {
     best_index
 }
 
-fn odom_samples(connection: &Connection, stream: &str) -> Result<Vec<[f64; 8]>, String> {
-    Ok(memory2::read_odometry(connection, stream, 1)?
+fn odom_samples(store: &Store, stream: &str) -> Result<Vec<[f64; 8]>, String> {
+    Ok(memory2::read_odometry(store, stream, 1)?
         .iter()
         .map(|row| {
             [
@@ -212,7 +212,7 @@ fn odom_samples(connection: &Connection, stream: &str) -> Result<Vec<[f64; 8]>, 
 
 /// Voxel-thinned world-space accumulation of a lidar stream (register=true applies the tf).
 fn accumulate(
-    connection: &Connection,
+    store: &Store,
     db_path: &Path,
     stream_name: &str,
     register: bool,
@@ -220,7 +220,7 @@ fn accumulate(
     world_frame: &str,
     fallback_frame: &str,
 ) -> Result<Vec<[f32; 3]>, String> {
-    let scans = memory2::read_scans(connection, stream_name, SCAN_STRIDE)
+    let scans = memory2::read_scans(store, stream_name, SCAN_STRIDE)
         .map_err(|_| format!("stream '{stream_name}' has no points in {}", db_path.display()))?;
     let mut all_points: Vec<[f32; 3]> = Vec::new();
     let mut unplaced = 0usize;
@@ -289,18 +289,18 @@ struct Landmark {
 /// Per marker: the mean tag position, plus the medoid glimpse -- the detection whose
 /// pose is most central -- which orients the tag square and places the camera frustum.
 fn landmarks(
-    connection: &Connection,
+    store: &Store,
     streams: &[String],
     tag_stream: &str,
     gt_odom: &str,
     base_to_optical: &Pose3,
 ) -> Result<Vec<Landmark>, String> {
-    let odom_rows = odom_samples(connection, gt_odom)?;
+    let odom_rows = odom_samples(store, gt_odom)?;
     if odom_rows.is_empty() || !streams.iter().any(|s| s == tag_stream) {
         return Ok(Vec::new());
     }
     let odom_times: Vec<f64> = odom_rows.iter().map(|row| row[0]).collect();
-    let raw = crate::detect::read_raw_tag_stream(connection, tag_stream)?;
+    let raw = crate::detect::read_raw_tag_stream(store, tag_stream)?;
     let detections = filter_glimpses(&raw, &Default::default(), &landmark_gates());
     let mut by_marker: BTreeMap<i64, Vec<(&Detection, Pose3, Pose3)>> = BTreeMap::new();
     for detection in &detections {
@@ -387,25 +387,11 @@ fn decode_rgb(image: &LcmImage) -> Result<(Vec<u8>, usize, usize), String> {
 
 /// The camera frame nearest `ts` (within `CAMERA_MATCH_SEC`), or None.
 fn camera_frame_at(
-    connection: &Connection,
+    store: &Store,
     camera_stream: &str,
     ts: f64,
 ) -> Option<(Vec<u8>, usize, usize)> {
-    if camera_stream.contains('"') {
-        return None;
-    }
-    let blob: Vec<u8> = connection
-        .query_row(
-            &format!(
-                "SELECT blob.data FROM \"{camera_stream}\" AS meta \
-                 JOIN \"{camera_stream}_blob\" AS blob ON meta.id = blob.id \
-                 WHERE ABS(meta.ts - ?1) <= ?2 ORDER BY ABS(meta.ts - ?1) LIMIT 1"
-            ),
-            rusqlite::params![ts, CAMERA_MATCH_SEC],
-            |row| row.get(0),
-        )
-        .ok()?;
-    let blob = memory2::decompress_if_lz4(blob);
+    let blob = store.nearest_blob(camera_stream, ts, CAMERA_MATCH_SEC)?;
     let image = LcmImage::decode(&blob).ok()?;
     decode_rgb(&image).ok()
 }
@@ -413,7 +399,7 @@ fn camera_frame_at(
 /// Place the camera's-eye image on a pinhole frustum at the pose it was taken from.
 fn log_medoid_camera(
     rec: &rerun::RecordingStream,
-    connection: &Connection,
+    store: &Store,
     camera_stream: &str,
     entity: &str,
     camera_model: Option<&CameraModel>,
@@ -423,7 +409,7 @@ fn log_medoid_camera(
     let Some(camera) = camera_model else {
         return Ok(false);
     };
-    let Some((rgb, width, height)) = camera_frame_at(connection, camera_stream, ts) else {
+    let Some((rgb, width, height)) = camera_frame_at(store, camera_stream, ts) else {
         return Ok(false);
     };
     let translation = [
@@ -481,7 +467,7 @@ fn log_medoid_camera(
 /// Write `corrected_compare.rrd` next to the db and return its path.
 #[allow(clippy::too_many_arguments)]
 pub fn build(
-    connection: &Connection,
+    store: &Store,
     db_path: &Path,
     lidar_stream: &str,
     odom_stream: &str,
@@ -494,18 +480,18 @@ pub fn build(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("corrected_compare.rrd");
-    let odom_tf = default_odom_edge(connection, odom_stream);
+    let odom_tf = default_odom_edge(store, odom_stream);
     let body_frame = if odom_tf.is_empty() {
         world_frame.to_string()
     } else {
         odom_tf.split_once(':').map(|(_, c)| c.to_string()).unwrap_or_default()
     };
     let lidar_frame = body_frame.clone();
-    let streams = memory2::list_streams(connection)?;
+    let streams = store.list_streams()?;
 
-    let odom_rows = odom_samples(connection, odom_stream)?;
+    let odom_rows = odom_samples(store, odom_stream)?;
     let tf_samples = if streams.iter().any(|s| s == "tf") {
-        memory2::read_tf(connection, "tf")?
+        memory2::read_tf(store, "tf")?
     } else {
         Vec::new()
     };
@@ -521,7 +507,7 @@ pub fn build(
 
     // base<-optical camera extrinsic, read from the tf tree
     let (camera_info, camera_info_tried) =
-        resolve_camera_info(connection, camera_stream, camera_info_stream)?;
+        resolve_camera_info(store, camera_stream, camera_info_stream)?;
     let mut camera_model = None;
     let mut base_to_optical = None;
     match camera_info {
@@ -556,7 +542,7 @@ pub fn build(
         .map_err(|e| e.to_string())?;
 
     let raw_cloud = accumulate(
-        connection,
+        store,
         db_path,
         lidar_stream,
         true,
@@ -592,7 +578,7 @@ pub fn build(
     for (lidar_index, lidar_name) in corrected_lidars.iter().enumerate() {
         let gradient = &CLOUD_GRADIENTS[lidar_index % CLOUD_GRADIENTS.len()];
         let cloud = accumulate(
-            connection,
+            store,
             db_path,
             lidar_name,
             false,
@@ -611,7 +597,7 @@ pub fn build(
     }
 
     if let Some(corrected_odom) = corrected_odoms.first() {
-        let corrected_positions: Vec<[f32; 3]> = odom_samples(connection, corrected_odom)?
+        let corrected_positions: Vec<[f32; 3]> = odom_samples(store, corrected_odom)?
             .iter()
             .map(|row| [row[1] as f32, row[2] as f32, row[3] as f32])
             .collect();
@@ -628,7 +614,7 @@ pub fn build(
             None => println!("no CameraInfo stream or optical tf edge -- skipping tag landmarks"),
             Some(base_to_optical) => {
                 let found =
-                    landmarks(connection, &streams, tag_stream, corrected_odom, base_to_optical)?;
+                    landmarks(store, &streams, tag_stream, corrected_odom, base_to_optical)?;
                 let mut images_logged = 0usize;
                 let half = TAG_SIZE_M / 2.0;
                 // marker-frame corners (aruco: x right, y up, z out), texcoord order TL TR BR BL
@@ -658,7 +644,7 @@ pub fn build(
                     .map_err(|e| e.to_string())?;
                     if log_medoid_camera(
                         &rec,
-                        connection,
+                        store,
                         camera_stream,
                         &format!("landmarks/tag{}/medoid_view", marker.marker_id),
                         camera_model.as_ref(),
@@ -696,7 +682,7 @@ pub fn build(
 /// Build the comparison rrd and open it in a locally-installed `rerun` viewer if present.
 #[allow(clippy::too_many_arguments)]
 pub fn build_and_open_rrd(
-    connection: &Connection,
+    store: &Store,
     db_path: &Path,
     lidar_stream: &str,
     odom_stream: &str,
@@ -707,7 +693,7 @@ pub fn build_and_open_rrd(
 ) -> Result<(), String> {
     println!("building comparison rrd...");
     let rrd_path = build(
-        connection,
+        store,
         db_path,
         lidar_stream,
         odom_stream,

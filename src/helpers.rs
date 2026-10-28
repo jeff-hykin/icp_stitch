@@ -16,10 +16,9 @@
 
 use lcm_msgs::sensor_msgs::{CameraInfo, Image as LcmImage, RegionOfInterest};
 use lcm_msgs::std_msgs;
-use rusqlite::Connection;
+use crate::store::Store;
 
 use crate::detect::sec_nsec;
-use crate::memory2;
 
 /// go2 front camera, 720p, from dimos `robot/unitree/go2/front_camera_720.yaml`
 /// (the same calibration the live `Go2Connection` publishes).
@@ -48,25 +47,11 @@ const CAMERA_INFO_MODULE: &str = "dimos.msgs.sensor_msgs.CameraInfo.CameraInfo";
 const CAMERA_INFO_STREAM: &str = "camera_info";
 const TF_STREAM: &str = "tf";
 
-fn first_image(connection: &Connection, stream: &str) -> Result<(f64, LcmImage), String> {
-    if !memory2::list_streams(connection)?.iter().any(|s| s == stream) {
+fn first_image(store: &Store, stream: &str) -> Result<(f64, LcmImage), String> {
+    if !store.list_streams()?.iter().any(|s| s == stream) {
         return Err(format!("no '{stream}' stream in this recording"));
     }
-    if stream.contains('"') {
-        return Err(format!("illegal stream name {stream:?}"));
-    }
-    let (ts, data) = connection
-        .query_row(
-            &format!(
-                "SELECT meta.ts, blob.data FROM \"{stream}\" AS meta \
-                 JOIN \"{stream}_blob\" AS blob ON meta.id = blob.id \
-                 ORDER BY meta.ts LIMIT 1"
-            ),
-            [],
-            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .map_err(|_| format!("'{stream}' is empty"))?;
-    let data = memory2::decompress_if_lz4(data);
+    let (ts, data) = store.first_blob(stream).ok_or_else(|| format!("'{stream}' is empty"))?;
     let image = LcmImage::decode(&data).map_err(|error| {
         format!("'{stream}' does not hold sensor_msgs.Image payloads ({error})")
     })?;
@@ -76,8 +61,8 @@ fn first_image(connection: &Connection, stream: &str) -> Result<(f64, LcmImage),
 /// Write the static go2 front-camera intrinsics into a recording that has none,
 /// so the AprilTag stage has something to work with. Additive and idempotent:
 /// the stream is rewritten on a re-run and nothing else in the db is touched.
-pub fn add_go2_camera_info(connection: &Connection, camera_stream: &str) -> Result<(), String> {
-    let (ts, image) = first_image(connection, camera_stream)?;
+pub fn add_go2_camera_info(store: &Store, camera_stream: &str) -> Result<(), String> {
+    let (ts, image) = first_image(store, camera_stream)?;
     if image.width != GO2_FRONT_720_WIDTH || image.height != GO2_FRONT_720_HEIGHT {
         return Err(format!(
             "'{camera_stream}' is {}x{}, but the go2 calibration is for {GO2_FRONT_720_WIDTH}x\
@@ -129,14 +114,14 @@ pub fn add_go2_camera_info(connection: &Connection, camera_stream: &str) -> Resu
             do_rectify: false,
         },
     };
-    memory2::delete_stream(connection, CAMERA_INFO_STREAM)?;
-    memory2::create_stream(connection, CAMERA_INFO_STREAM, CAMERA_INFO_MODULE)?;
-    memory2::append(connection, CAMERA_INFO_STREAM, ts, None, &[], &info.encode())?;
+    store.delete_stream(CAMERA_INFO_STREAM)?;
+    store.create_stream(CAMERA_INFO_STREAM, CAMERA_INFO_MODULE)?;
+    store.append(CAMERA_INFO_STREAM, ts, None, &[], &info.encode())?;
     println!(
         "wrote {CAMERA_INFO_STREAM}: go2 front camera 720p ({GO2_FRONT_720_DISTORTION_MODEL}) in \
          frame '{frame_id}'"
     );
-    if !memory2::list_streams(connection)?.iter().any(|s| s == TF_STREAM) {
+    if !store.list_streams()?.iter().any(|s| s == TF_STREAM) {
         println!(
             "NOTE: this recording has no '{TF_STREAM}' stream, so the base<-'{frame_id}' extrinsic \
              cannot be resolved -- the solve still needs --base-optical 'x y z qx qy qz qw'."

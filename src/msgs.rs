@@ -78,6 +78,10 @@ impl<'a> Reader<'a> {
         Ok(f64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
+    fn u64(&mut self) -> io::Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
     fn u32(&mut self) -> io::Result<u32> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
@@ -104,6 +108,15 @@ pub struct PoseStamped {
 }
 
 impl PoseStamped {
+    fn read(r: &mut Reader) -> io::Result<Self> {
+        Ok(PoseStamped {
+            ts: r.f64()?,
+            frame_id: r.string()?,
+            position: [r.f64()?, r.f64()?, r.f64()?],
+            orientation: [r.f64()?, r.f64()?, r.f64()?, r.f64()?],
+        })
+    }
+
     fn write(&self, out: &mut Vec<u8>) {
         write_f64_be(out, self.ts);
         write_str(out, &self.frame_id);
@@ -150,6 +163,22 @@ pub struct Graph3D {
 }
 
 impl Graph3D {
+    pub fn decode(data: &[u8]) -> io::Result<Self> {
+        let mut r = Reader::new(data);
+        let edge_count = r.u64()? as usize;
+        let node_count = r.u64()? as usize;
+        let ts = r.f64()?;
+        let mut nodes = Vec::with_capacity(node_count.min(r.remaining()));
+        for _ in 0..node_count {
+            nodes.push(Node3D { pose: PoseStamped::read(&mut r)?, id: r.u64()?, metadata_id: r.u64()? });
+        }
+        let mut edges = Vec::with_capacity(edge_count.min(r.remaining()));
+        for _ in 0..edge_count {
+            edges.push(Edge { start_id: r.u64()?, end_id: r.u64()?, timestamp: r.f64()?, metadata_id: r.u64()? });
+        }
+        Ok(Graph3D { ts, nodes, edges })
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(24 + self.nodes.len() * 100 + self.edges.len() * 32);
         write_u64_be(&mut out, self.edges.len() as u64);
@@ -236,6 +265,11 @@ pub struct DeformationNode {
 }
 
 impl DeformationNode {
+    pub fn decode(data: &[u8]) -> io::Result<Self> {
+        let mut r = Reader::new(data);
+        Ok(DeformationNode { id: r.u64()?, tf_id: r.u64()?, pose: PoseStamped::read(&mut r)? })
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(20 + self.pose.frame_id.len() + 56);
         write_u64_be(&mut out, self.id);
@@ -309,6 +343,19 @@ impl LocationConstraint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_and_deformation_node_round_trip() {
+        let pose = PoseStamped { ts: 12.5, frame_id: "world".into(), position: [1.0, 2.0, 3.0], orientation: [0.0, 0.0, 0.0, 1.0] };
+        let graph = Graph3D {
+            ts: 13.0,
+            nodes: vec![Node3D { pose: pose.clone(), id: 0, metadata_id: 0 }, Node3D { pose: pose.clone(), id: 1, metadata_id: 4 }],
+            edges: vec![Edge { start_id: 0, end_id: 1, timestamp: 13.0, metadata_id: 0 }],
+        };
+        assert_eq!(Graph3D::decode(&graph.encode()).unwrap(), graph);
+        let node = DeformationNode { id: 3, tf_id: tf_id_for("world", "base_link"), pose };
+        assert_eq!(DeformationNode::decode(&node.encode()).unwrap(), node);
+    }
 
     #[test]
     fn fnv1a_matches_python_reference() {

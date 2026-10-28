@@ -1,7 +1,9 @@
 pub mod apriltags;
 pub mod artifacts;
+pub mod cdr;
 pub mod detect;
 pub mod helpers;
+pub mod mcap;
 pub mod mat3;
 pub mod memory2;
 pub mod msgs;
@@ -11,5 +13,6 @@ pub mod recording;
 #[cfg(feature = "rrd")]
 pub mod rrd;
 pub mod se3;
+pub mod store;
 pub mod tf;
 pub mod voxel_ray_tracer;

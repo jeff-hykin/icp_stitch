@@ -71,46 +71,52 @@ fn quote_ident(name: &str) -> Result<String, String> {
     Ok(format!("\"{name}\""))
 }
 
-/// Join a stream's metadata + blob tables on id, ordered by timestamp, and hand
-/// each `(ts, blob)` to `decode`. Rows the decoder returns `None` for are
-/// skipped (e.g. a corrupt frame), so a single bad message never aborts a run.
-///
-/// `stride` keeps every `stride`-th row (1 = all). The stride is applied here,
-/// before decoding, so strided-out blobs are never decoded or retained — a huge
-/// recording can be subsampled without materializing every scan in memory.
-fn read_stream<T>(
-    connection: &Connection,
-    stream: &str,
-    stride: usize,
-    mut decode: impl FnMut(f64, &[u8]) -> Option<T>,
-) -> Result<Vec<T>, String> {
-    let stride = stride.max(1);
-    let table = quote_ident(stream)?;
-    let blob_table = quote_ident(&format!("{stream}_blob"))?;
-    let sql = format!(
-        "SELECT meta.ts, blob.data FROM {table} AS meta \
-         JOIN {blob_table} AS blob ON meta.id = blob.id ORDER BY meta.ts"
-    );
-    let mut statement = connection.prepare(&sql).map_err(|e| e.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            let ts: f64 = row.get(0)?;
-            let data: Vec<u8> = row.get(1)?;
-            Ok((ts, data))
-        })
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for (index, row) in rows.enumerate() {
-        if index % stride != 0 {
-            continue;
+/// Anything rows of a stream can be read from: a memory2 `.db` connection, or a
+/// `store::Store` (which may be an `.mcap`). The blob handed to `decode` is always the
+/// LCM encoding a `.db` row holds.
+pub trait Rows {
+    /// Every row of `stream` in ts order, each `(ts, blob)` handed to `decode`; rows it
+    /// returns `None` for are skipped (e.g. a corrupt frame), so a single bad message
+    /// never aborts a run.
+    ///
+    /// `stride` keeps every `stride`-th row (1 = all). The stride is applied before
+    /// decoding, so strided-out blobs are never decoded or retained -- a huge recording
+    /// can be subsampled without materializing every scan in memory.
+    fn read_stream<T>(&self, stream: &str, stride: usize, decode: impl FnMut(f64, &[u8]) -> Option<T>) -> Result<Vec<T>, String>;
+}
+
+/// Join a stream's metadata + blob tables on id, ordered by timestamp.
+impl Rows for Connection {
+    fn read_stream<T>(&self, stream: &str, stride: usize, mut decode: impl FnMut(f64, &[u8]) -> Option<T>) -> Result<Vec<T>, String> {
+        let connection = self;
+        let stride = stride.max(1);
+        let table = quote_ident(stream)?;
+        let blob_table = quote_ident(&format!("{stream}_blob"))?;
+        let sql = format!(
+            "SELECT meta.ts, blob.data FROM {table} AS meta \
+             JOIN {blob_table} AS blob ON meta.id = blob.id ORDER BY meta.ts"
+        );
+        let mut statement = connection.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                let ts: f64 = row.get(0)?;
+                let data: Vec<u8> = row.get(1)?;
+                Ok((ts, data))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for (index, row) in rows.enumerate() {
+            if index % stride != 0 {
+                continue;
+            }
+            let (ts, data) = row.map_err(|e| e.to_string())?;
+            let data = decompress_if_lz4(data);
+            if let Some(value) = decode(ts, &data) {
+                out.push(value);
+            }
         }
-        let (ts, data) = row.map_err(|e| e.to_string())?;
-        let data = decompress_if_lz4(data);
-        if let Some(value) = decode(ts, &data) {
-            out.push(value);
-        }
+        Ok(out)
     }
-    Ok(out)
 }
 
 fn odom_from_odometry(ts: f64, message: &Odometry) -> OdomRow {
@@ -167,11 +173,11 @@ fn odom_from_pose(
 /// `geometry_msgs/PoseStamped` payloads (legacy go2 recordings store the
 /// latter). The fingerprint check makes the choice unambiguous per blob.
 pub fn read_odometry(
-    connection: &Connection,
+    connection: &(impl Rows + ?Sized),
     stream: &str,
     stride: usize,
 ) -> Result<Vec<OdomRow>, String> {
-    let rows = read_stream(connection, stream, stride, |ts, data| {
+    let rows = connection.read_stream(stream, stride, |ts, data| {
         if let Ok(message) = Odometry::decode(data) {
             return Some(odom_from_odometry(ts, &message));
         }
@@ -250,8 +256,8 @@ pub struct TfSample {
 }
 
 /// Read a tf stream of TFMessage rows, flattened to per-edge samples.
-pub fn read_tf(connection: &Connection, stream: &str) -> Result<Vec<TfSample>, String> {
-    let nested = read_stream(connection, stream, 1, |row_ts, data| {
+pub fn read_tf(connection: &(impl Rows + ?Sized), stream: &str) -> Result<Vec<TfSample>, String> {
+    let nested = connection.read_stream(stream, 1, |row_ts, data| {
         let message = TFMessage::decode(data).ok()?;
         let samples: Vec<TfSample> = message
             .transforms
@@ -284,11 +290,11 @@ pub fn read_tf(connection: &Connection, stream: &str) -> Result<Vec<TfSample>, S
 
 /// Read a lidar stream of PointCloud2 scans.
 pub fn read_scans(
-    connection: &Connection,
+    connection: &(impl Rows + ?Sized),
     stream: &str,
     stride: usize,
 ) -> Result<Vec<ScanRow>, String> {
-    let rows = read_stream(connection, stream, stride, |ts, data| {
+    let rows = connection.read_stream(stream, stride, |ts, data| {
         let message = PointCloud2::decode(data).ok()?;
         let (points, intensities) = extract_xyz(&message)?;
         Some(ScanRow {

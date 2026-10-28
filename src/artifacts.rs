@@ -27,9 +27,9 @@ use lcm_msgs::nav_msgs::Odometry;
 use lcm_msgs::sensor_msgs::{PointCloud2, PointField};
 use lcm_msgs::std_msgs;
 use lcm_msgs::tf2_msgs::TFMessage;
-use rusqlite::Connection;
+use crate::store::Store;
 
-use crate::memory2::{self, ScanRow, TfSample};
+use crate::memory2::{ScanRow, TfSample};
 use crate::msgs::{DeformationNode, Edge, Graph3D, Node3D, PoseStamped, tf_id_for};
 use crate::pgo::OdomPoseRow;
 use crate::pointcloud::KdTree;
@@ -219,7 +219,7 @@ fn encode_tf_edge(ts: f64, parent: &str, child: &str, pose: &[f64; 7]) -> Vec<u8
 
 /// Per keyframe: the raw pose then the optimized pose, so tf.get can replay the correction.
 pub fn write_deformation_nodes(
-    connection: &Connection,
+    store: &Store,
     name: &str,
     keyframe_times: &[f64],
     raw_poses: &[Pose3],
@@ -227,10 +227,10 @@ pub fn write_deformation_nodes(
     world_frame: &str,
     body_frame: &str,
 ) -> Result<(), String> {
-    if memory2::list_streams(connection)?.iter().any(|s| s == name) {
-        memory2::delete_stream(connection, name)?;
+    if store.list_streams()?.iter().any(|s| s == name) {
+        store.delete_stream(name)?;
     }
-    memory2::create_stream(connection, name, DEFORMATION_NODE_MODULE)?;
+    store.create_stream(name, DEFORMATION_NODE_MODULE)?;
     let edge_id = tf_id_for(world_frame, body_frame);
     for index in 0..keyframe_times.len() {
         let node_ts = keyframe_times[index];
@@ -246,9 +246,7 @@ pub fn write_deformation_nodes(
                     orientation: [tuple[3], tuple[4], tuple[5], tuple[6]],
                 },
             };
-            memory2::append(
-                connection,
-                name,
+            store.append(name,
                 node_ts,
                 None,
                 &[
@@ -265,16 +263,16 @@ pub fn write_deformation_nodes(
 
 /// The optimized keyframe nodes + sequential odom edges as a Graph3D.
 pub fn write_pose_graph(
-    connection: &Connection,
+    store: &Store,
     name: &str,
     keyframe_times: &[f64],
     optimized: &[Pose3],
     world_frame: &str,
 ) -> Result<(), String> {
-    if memory2::list_streams(connection)?.iter().any(|s| s == name) {
-        memory2::delete_stream(connection, name)?;
+    if store.list_streams()?.iter().any(|s| s == name) {
+        store.delete_stream(name)?;
     }
-    memory2::create_stream(connection, name, GRAPH3D_MODULE)?;
+    store.create_stream(name, GRAPH3D_MODULE)?;
     let num_keyframes = keyframe_times.len();
     let nodes: Vec<Node3D> = (0..num_keyframes)
         .map(|index| {
@@ -306,7 +304,7 @@ pub fn write_pose_graph(
         edges,
     };
     let edge_count = graph.edges.len();
-    memory2::append(connection, name, graph_ts, None, &[], &graph.encode())?;
+    store.append(name, graph_ts, None, &[], &graph.encode())?;
     println!("wrote {name}: {num_keyframes} nodes, {edge_count} edges");
     Ok(())
 }
@@ -314,7 +312,7 @@ pub fn write_pose_graph(
 /// Corrected trajectory as `world_frame -> corrected_body_frame` odometry, i.e. the
 /// localization edge of the corrected tf tree the per-scan corrected clouds hang on.
 pub fn write_corrected_odom(
-    connection: &Connection,
+    store: &Store,
     name: &str,
     odom_rows: &[OdomPoseRow],
     keyframe_times: &[f64],
@@ -322,10 +320,10 @@ pub fn write_corrected_odom(
     world_frame: &str,
     corrected_body_frame: &str,
 ) -> Result<(), String> {
-    if memory2::list_streams(connection)?.iter().any(|s| s == name) {
-        memory2::delete_stream(connection, name)?;
+    if store.list_streams()?.iter().any(|s| s == name) {
+        store.delete_stream(name)?;
     }
-    memory2::create_stream(connection, name, ODOMETRY_MODULE)?;
+    store.create_stream(name, ODOMETRY_MODULE)?;
     println!("writing {name} ({} poses)...", odom_rows.len());
     let started = Instant::now();
     for (count, row) in odom_rows.iter().enumerate() {
@@ -335,7 +333,7 @@ pub fn write_corrected_odom(
             se3::compose(&interpolate_correction(keyframe_times, corrections, ts), &raw);
         let tuple = se3::pose_tuple(&corrected);
         let blob = encode_odometry(ts, world_frame, corrected_body_frame, &tuple);
-        memory2::append(connection, name, ts, Some(tuple), &[], &blob)?;
+        store.append(name, ts, Some(tuple), &[], &blob)?;
         if (count + 1) % ODOM_LOG_EVERY == 0 {
             println!(
                 "  {}/{} poses, {:.0}s",
@@ -401,7 +399,7 @@ fn samples_are_static(samples: &[&TfSample]) -> bool {
 /// second late, which would leave the earliest scans unresolvable.
 #[allow(clippy::too_many_arguments)]
 pub fn write_corrected_tf_tree(
-    connection: &Connection,
+    store: &Store,
     name: &str,
     tf_samples: &[TfSample],
     odom_rows: &[OdomPoseRow],
@@ -412,10 +410,10 @@ pub fn write_corrected_tf_tree(
     corrected_body_frame: &str,
     frame_suffix: &str,
 ) -> Result<(), String> {
-    if memory2::list_streams(connection)?.iter().any(|s| s == name) {
-        memory2::delete_stream(connection, name)?;
+    if store.list_streams()?.iter().any(|s| s == name) {
+        store.delete_stream(name)?;
     }
-    memory2::create_stream(connection, name, TFMESSAGE_MODULE)?;
+    store.create_stream(name, TFMESSAGE_MODULE)?;
     let start_ts = tf_samples
         .iter()
         .map(|sample| sample.ts)
@@ -430,9 +428,7 @@ pub fn write_corrected_tf_tree(
             &interpolate_correction(keyframe_times, corrections, ts),
             &raw,
         );
-        memory2::append(
-            connection,
-            name,
+        store.append(name,
             ts,
             None,
             &[("child_frame", corrected_body_frame.to_string())],
@@ -474,9 +470,7 @@ pub fn write_corrected_tf_tree(
         for (ts, sample) in stamped {
             let [x, y, z] = sample.translation;
             let [qx, qy, qz, qw] = sample.quaternion_xyzw;
-            memory2::append(
-                connection,
-                name,
+            store.append(name,
                 ts,
                 None,
                 &[("child_frame", child.clone())],
@@ -620,7 +614,7 @@ fn remove_statistical_outlier(
 /// aggregated, world-baked .pc2.lcm (a single fused cloud has no tf to hang on).
 #[allow(clippy::too_many_arguments)]
 pub fn write_corrected_lidar(
-    connection: &Connection,
+    store: &Store,
     name: &str,
     scans: &[ScanRow],
     odom_rows: &[OdomPoseRow],
@@ -632,10 +626,10 @@ pub fn write_corrected_lidar(
     world_frame: &str,
     corrected_body_frame: &str,
 ) -> Result<(), String> {
-    if memory2::list_streams(connection)?.iter().any(|s| s == name) {
-        memory2::delete_stream(connection, name)?;
+    if store.list_streams()?.iter().any(|s| s == name) {
+        store.delete_stream(name)?;
     }
-    memory2::create_stream(connection, name, POINTCLOUD2_MODULE)?;
+    store.create_stream(name, POINTCLOUD2_MODULE)?;
     let odom_times: Vec<f64> = odom_rows.iter().map(|row| row[0]).collect();
     let mut aggregated_points: Vec<Vec<[f32; 3]>> = Vec::new();
     let mut aggregated_intensities: Vec<Vec<f32>> = Vec::new();
@@ -675,7 +669,7 @@ pub fn write_corrected_lidar(
             ts,
         );
         let pose = se3::pose_tuple(&se3::compose(&correction, &raw_pose));
-        memory2::append(connection, name, ts, Some(pose), &[], &blob)?;
+        store.append(name, ts, Some(pose), &[], &blob)?;
         if lcm_path.is_some() {
             let corrected_points: Vec<[f32; 3]> = points
                 .iter()
@@ -778,7 +772,7 @@ pub fn write_aggregated_lcm(
 /// free space along every ray so dynamic objects and registration ghosts get cleared,
 /// not smeared.
 pub fn raycast_accumulate(
-    connection: &Connection,
+    store: &Store,
     in_stream: &str,
     scans: &[ScanRow],
     store_tf: &RecordingTf,
@@ -833,12 +827,12 @@ pub fn raycast_accumulate(
             .into_iter()
             .map(|(x, y, z)| [x, y, z])
             .collect();
-    if memory2::list_streams(connection)?.iter().any(|s| *s == out_stream) {
-        memory2::delete_stream(connection, &out_stream)?;
+    if store.list_streams()?.iter().any(|s| *s == out_stream) {
+        store.delete_stream(&out_stream)?;
     }
-    memory2::create_stream(connection, &out_stream, POINTCLOUD2_MODULE)?;
+    store.create_stream(&out_stream, POINTCLOUD2_MODULE)?;
     let blob = encode_pointcloud2(&accumulated, None, world_frame, last_ts);
-    memory2::append(connection, &out_stream, last_ts, None, &[], &blob)?;
+    store.append(&out_stream, last_ts, None, &[], &blob)?;
     println!(
         "wrote {out_stream}: {} pts from {scan_count} scans in {:.0}s",
         format_thousands(accumulated.len()),
@@ -850,6 +844,8 @@ pub fn raycast_accumulate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory2;
+    use rusqlite::Connection;
     use crate::memory2::read_scans;
 
     fn identity() -> Pose3 {
@@ -918,12 +914,13 @@ mod tests {
 
     #[test]
     fn corrected_streams_round_trip_through_python_schema() {
-        let connection = Connection::open_in_memory().unwrap();
+        let store = Store::Db(Connection::open_in_memory().unwrap());
+        let connection = store.connection().unwrap();
         let times = [0.0, 10.0];
         let raw = [identity(), translation(1.0, 0.0, 0.0)];
         let optimized = [identity(), translation(1.5, 0.0, 0.0)];
         write_deformation_nodes(
-            &connection,
+            &store,
             "tf_nodes_corrected",
             &times,
             &raw,
@@ -932,7 +929,7 @@ mod tests {
             "base",
         )
         .unwrap();
-        write_pose_graph(&connection, "pose_graph", &times, &optimized, "world").unwrap();
+        write_pose_graph(&store, "pose_graph", &times, &optimized, "world").unwrap();
 
         let corrections = [identity(), translation(0.5, 0.0, 0.0)];
         let odom_rows: Vec<OdomPoseRow> = vec![
@@ -940,7 +937,7 @@ mod tests {
             [10.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         ];
         write_corrected_odom(
-            &connection,
+            &store,
             "odom_corrected",
             &odom_rows,
             &times,
@@ -951,7 +948,7 @@ mod tests {
         .unwrap();
 
         // registry rows exist with the exact python payload modules
-        let streams = memory2::list_streams(&connection).unwrap();
+        let streams = memory2::list_streams(connection).unwrap();
         assert_eq!(
             streams,
             vec!["odom_corrected", "pose_graph", "tf_nodes_corrected"]
@@ -978,7 +975,7 @@ mod tests {
         assert_eq!(tagged, 2);
 
         // corrected odom: read back through our own reader; poses = correction ∘ raw
-        let rows = memory2::read_odometry(&connection, "odom_corrected", 1).unwrap();
+        let rows = memory2::read_odometry(connection, "odom_corrected", 1).unwrap();
         assert_eq!(rows.len(), 2);
         assert!((rows[1].translation[0] - 1.5).abs() < 1e-9);
         assert_eq!(rows[1].frame_id, "world");
@@ -1007,7 +1004,7 @@ mod tests {
         };
         let lcm_file = std::env::temp_dir().join("icp_stitch_test_agg.pc2.lcm");
         write_corrected_lidar(
-            &connection,
+            &store,
             "lidar_corrected",
             &scans,
             &odom_rows,
@@ -1020,7 +1017,7 @@ mod tests {
             "odom_corrected_frame",
         )
         .unwrap();
-        let read = read_scans(&connection, "lidar_corrected", 1).unwrap();
+        let read = read_scans(connection, "lidar_corrected", 1).unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].points.len(), 2);
         assert_eq!(read[0].intensities.as_ref().unwrap(), &vec![7.0, 8.0]);
@@ -1044,7 +1041,8 @@ mod tests {
         use crate::memory2::read_tf;
         use crate::tf::RecordingTf;
 
-        let connection = Connection::open_in_memory().unwrap();
+        let store = Store::Db(Connection::open_in_memory().unwrap());
+        let connection = store.connection().unwrap();
         // recorded tree: a dynamic world -> base localization edge, a static sensor mount
         // published late and repeatedly, and one more static frame below the sensor
         let mut samples = vec![
@@ -1063,7 +1061,7 @@ mod tests {
             [10.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         ];
         write_corrected_tf_tree(
-            &connection,
+            &store,
             "tf_corrected",
             &samples,
             &odom_rows,
@@ -1076,7 +1074,7 @@ mod tests {
         )
         .unwrap();
 
-        let written = read_tf(&connection, "tf_corrected").unwrap();
+        let written = read_tf(connection, "tf_corrected").unwrap();
         let edges: BTreeSet<(String, String)> = written
             .iter()
             .map(|sample| (sample.parent.clone(), sample.child.clone()))
@@ -1112,7 +1110,7 @@ mod tests {
 
         // re-running replaces the stream instead of accumulating a second copy
         write_corrected_tf_tree(
-            &connection,
+            &store,
             "tf_corrected",
             &samples,
             &odom_rows,
@@ -1125,7 +1123,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_tf(&connection, "tf_corrected").unwrap().len(),
+            read_tf(connection, "tf_corrected").unwrap().len(),
             written.len()
         );
     }

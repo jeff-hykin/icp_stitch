@@ -23,11 +23,11 @@ use lcm_msgs::geometry_msgs;
 use lcm_msgs::nav_msgs::Odometry;
 use lcm_msgs::std_msgs;
 use lcm_msgs::tf2_msgs::TFMessage;
-use rusqlite::Connection;
+use crate::store::Store;
 
 use crate::artifacts::{self, encode_pointcloud2};
 use crate::mat3;
-use crate::memory2::{self, read_odometry, read_raw_rows, read_scans, read_tf};
+use crate::memory2::{read_odometry, read_scans, read_tf};
 use crate::pgo::OdomPoseRow;
 use crate::se3;
 use crate::tf::RecordingTf;
@@ -86,37 +86,10 @@ pub fn resolve_streams(available: &[String], odom: &str, lidar: &str) -> (String
     (odom, lidar)
 }
 
-fn payload_module(connection: &Connection, stream: &str) -> Option<String> {
-    connection
-        .query_row(
-            "SELECT json_extract(config, '$.payload_module') FROM _streams WHERE name = ?",
-            [stream],
-            |row| row.get(0),
-        )
-        .ok()
-}
-
-fn first_blob(connection: &Connection, stream: &str) -> Option<Vec<u8>> {
-    if stream.contains('"') {
-        return None;
-    }
-    connection
-        .query_row(
-            &format!(
-                "SELECT blob.data FROM \"{stream}\" AS meta \
-                 JOIN \"{stream}_blob\" AS blob ON meta.id = blob.id \
-                 ORDER BY meta.ts LIMIT 1"
-            ),
-            [],
-            |row| row.get(0),
-        )
-        .ok()
-}
-
 /// `"parent:child"` from the odom stream's own header, or `""` if it has no child frame
 /// (e.g. `PoseStamped` odometry).
-pub fn default_odom_edge(connection: &Connection, odom_stream: &str) -> String {
-    let Some(blob) = first_blob(connection, odom_stream) else {
+pub fn default_odom_edge(store: &Store, odom_stream: &str) -> String {
+    let Some((_, blob)) = store.first_blob(odom_stream) else {
         return String::new();
     };
     let Ok(message) = Odometry::decode(&blob) else {
@@ -129,16 +102,16 @@ pub fn default_odom_edge(connection: &Connection, odom_stream: &str) -> String {
 }
 
 /// True when `odom_stream` is a go2-legacy bare-`Pose` odom (not `Odometry`).
-fn is_go2_legacy(connection: &Connection, odom_stream: &str) -> bool {
+fn is_go2_legacy(store: &Store, odom_stream: &str) -> bool {
     if !LEGACY_ODOM_STREAMS.contains(&odom_stream) {
         return false;
     }
-    payload_module(connection, odom_stream).as_deref() == Some(POSE_STAMPED_MODULE)
+    store.payload_module(odom_stream).as_deref() == Some(POSE_STAMPED_MODULE)
 }
 
 /// `(N, 8)` `ts, x, y, z, qx, qy, qz, qw` from the odom `Pose` payloads, NaN-filtered.
-fn odom_pose_rows(connection: &Connection, odom_stream: &str) -> Result<Vec<OdomPoseRow>, String> {
-    let rows = read_odometry(connection, odom_stream, 1)?;
+fn odom_pose_rows(store: &Store, odom_stream: &str) -> Result<Vec<OdomPoseRow>, String> {
+    let rows = read_odometry(store, odom_stream, 1)?;
     Ok(rows
         .iter()
         .map(|row| {
@@ -164,26 +137,24 @@ fn odom_pose_rows(connection: &Connection, odom_stream: &str) -> Result<Vec<Odom
 /// hand-rolled quat math; scans already in a sensor frame pass through unchanged. Either way
 /// the latched odom pose is kept on the row so `p_world = pose * p_l1` reconstructs the map.
 fn write_l1_cloud(
-    connection: &Connection,
+    store: &Store,
     source_lidar: &str,
     odom_rows: &[OdomPoseRow],
     world_frame: &str,
     tf: &RecordingTf,
 ) -> Result<(), String> {
     let odom_times: Vec<f64> = odom_rows.iter().map(|row| row[0]).collect();
-    if memory2::list_streams(connection)?
+    if store.list_streams()?
         .iter()
         .any(|s| s == GO2_CORRECTED_LIDAR_STREAM_NAME)
     {
-        memory2::delete_stream(connection, GO2_CORRECTED_LIDAR_STREAM_NAME)?;
+        store.delete_stream(GO2_CORRECTED_LIDAR_STREAM_NAME)?;
     }
-    memory2::create_stream(
-        connection,
-        GO2_CORRECTED_LIDAR_STREAM_NAME,
+    store.create_stream(GO2_CORRECTED_LIDAR_STREAM_NAME,
         artifacts::POINTCLOUD2_MODULE,
     )?;
     let mut count = 0usize;
-    for scan in read_scans(connection, source_lidar, 1)? {
+    for scan in read_scans(store, source_lidar, 1)? {
         let scan_ts = scan.ts;
         // searchsorted(side="right") - 1, clamped: the pose latched at scan time
         let latched = odom_times
@@ -214,9 +185,7 @@ fn write_l1_cloud(
             GO2_CORRECTED_LIDAR_FRAME,
             scan_ts,
         );
-        memory2::append(
-            connection,
-            GO2_CORRECTED_LIDAR_STREAM_NAME,
+        store.append(GO2_CORRECTED_LIDAR_STREAM_NAME,
             scan_ts,
             Some(xyzquat),
             &[],
@@ -268,14 +237,14 @@ fn encode_static_tf_edge(stamp: f64, base_frame: &str) -> Vec<u8> {
 /// tf tree. `l1_link` is only ever introduced here, so any pre-existing edge into it is a
 /// leftover from an earlier normalize run; strip all of them first (rewriting the stream, the
 /// only removal the store API offers) so re-runs never accumulate duplicates.
-fn write_static_tf(connection: &Connection, stamp: f64, base_frame: &str) -> Result<(), String> {
-    if !memory2::list_streams(connection)?
+fn write_static_tf(store: &Store, stamp: f64, base_frame: &str) -> Result<(), String> {
+    if !store.list_streams()?
         .iter()
         .any(|s| s == TF_STREAM)
     {
-        memory2::create_stream(connection, TF_STREAM, artifacts::TFMESSAGE_MODULE)?;
+        store.create_stream(TF_STREAM, artifacts::TFMESSAGE_MODULE)?;
     }
-    let rows = read_raw_rows(connection, TF_STREAM)?;
+    let rows = store.read_raw_rows(TF_STREAM)?;
     let mut kept = Vec::new();
     let mut stale = 0usize;
     for row in rows {
@@ -294,12 +263,10 @@ fn write_static_tf(connection: &Connection, stamp: f64, base_frame: &str) -> Res
         }
     }
     if stale > 0 {
-        memory2::delete_stream(connection, TF_STREAM)?;
-        memory2::create_stream(connection, TF_STREAM, artifacts::TFMESSAGE_MODULE)?;
+        store.delete_stream(TF_STREAM)?;
+        store.create_stream(TF_STREAM, artifacts::TFMESSAGE_MODULE)?;
         for row in &kept {
-            memory2::append_raw(
-                connection,
-                TF_STREAM,
+            store.append_raw(TF_STREAM,
                 row.ts,
                 row.pose,
                 &row.tags_json,
@@ -307,9 +274,7 @@ fn write_static_tf(connection: &Connection, stamp: f64, base_frame: &str) -> Res
             )?;
         }
     }
-    memory2::append(
-        connection,
-        TF_STREAM,
+    store.append(TF_STREAM,
         stamp,
         None,
         &[("child_frame", GO2_CORRECTED_LIDAR_FRAME.to_string())],
@@ -324,19 +289,17 @@ fn write_static_tf(connection: &Connection, stamp: f64, base_frame: &str) -> Res
 
 /// Rewrite the bare-`Pose` odom as a proper `world -> l1_link` `Odometry` stream.
 fn write_go2_odometry(
-    connection: &Connection,
+    store: &Store,
     odom_rows: &[OdomPoseRow],
     world_frame: &str,
 ) -> Result<(), String> {
-    if memory2::list_streams(connection)?
+    if store.list_streams()?
         .iter()
         .any(|s| s == GO2_CORRECTED_ODOMETRY_STREAM_NAME)
     {
-        memory2::delete_stream(connection, GO2_CORRECTED_ODOMETRY_STREAM_NAME)?;
+        store.delete_stream(GO2_CORRECTED_ODOMETRY_STREAM_NAME)?;
     }
-    memory2::create_stream(
-        connection,
-        GO2_CORRECTED_ODOMETRY_STREAM_NAME,
+    store.create_stream(GO2_CORRECTED_ODOMETRY_STREAM_NAME,
         artifacts::ODOMETRY_MODULE,
     )?;
     for row in odom_rows {
@@ -348,9 +311,7 @@ fn write_go2_odometry(
             GO2_CORRECTED_LIDAR_FRAME,
             &pose,
         );
-        memory2::append(
-            connection,
-            GO2_CORRECTED_ODOMETRY_STREAM_NAME,
+        store.append(GO2_CORRECTED_ODOMETRY_STREAM_NAME,
             stamp,
             Some(pose),
             &[],
@@ -370,7 +331,7 @@ fn write_go2_odometry(
 /// tf, and a `go2_odometry` stream, then returns `("<world>:l1_link", "go2_odometry",
 /// "l1_cloud")`. Any other recording is untouched and its inputs are returned unchanged.
 pub fn normalize_go2_legacy(
-    connection: &Connection,
+    store: &Store,
     odom_tf: &str,
     odom_stream: &str,
     lidar_stream: &str,
@@ -382,10 +343,16 @@ pub fn normalize_go2_legacy(
             lidar_stream.to_string(),
         )
     };
-    if !is_go2_legacy(connection, odom_stream) {
+    if !is_go2_legacy(store, odom_stream) {
         return Ok(unchanged());
     }
-    let odom_rows = odom_pose_rows(connection, odom_stream)?;
+    if store.is_mcap() {
+        return Err(format!(
+            "'{odom_stream}' is go2-legacy PoseStamped odometry, whose normalize rewrites the \
+             recording's tf stream; convert the .mcap to a .db (dtk mcap_to_db) and run on that"
+        ));
+    }
+    let odom_rows = odom_pose_rows(store, odom_stream)?;
     if odom_rows.is_empty() {
         return Ok(unchanged());
     }
@@ -398,7 +365,7 @@ pub fn normalize_go2_legacy(
     // go2_odometry + the static tf get written in an empty frame and every world<->l1_link
     // lookup fails (raw map + comparison rrd come out empty).
     if world_frame.is_empty() {
-        let header_frame = read_odometry(connection, odom_stream, 1)?
+        let header_frame = read_odometry(store, odom_stream, 1)?
             .first()
             .map(|row| row.frame_id.clone())
             .unwrap_or_default();
@@ -416,11 +383,11 @@ pub fn normalize_go2_legacy(
     println!("go2 legacy recording: deriving l1_cloud / go2_odometry / l1_link tf");
     // Ephemeral world->l1_link edge (the odom trajectory) so write_l1_cloud un-registers
     // world-framed scans through the tf chain instead of hand-rolled quat math.
-    let tf_samples = if memory2::list_streams(connection)?
+    let tf_samples = if store.list_streams()?
         .iter()
         .any(|s| s == TF_STREAM)
     {
-        read_tf(connection, TF_STREAM)?
+        read_tf(store, TF_STREAM)?
     } else {
         Vec::new()
     };
@@ -430,9 +397,9 @@ pub fn normalize_go2_legacy(
         .map(|row| (row[0], se3::from_xyzquat(&row[1..])))
         .collect();
     tf.override_edge(&world_frame, GO2_CORRECTED_LIDAR_FRAME, trajectory);
-    write_l1_cloud(connection, lidar_stream, &odom_rows, &world_frame, &tf)?;
-    write_static_tf(connection, odom_rows[0][0], &base_frame)?;
-    write_go2_odometry(connection, &odom_rows, &world_frame)?;
+    write_l1_cloud(store, lidar_stream, &odom_rows, &world_frame, &tf)?;
+    write_static_tf(store, odom_rows[0][0], &base_frame)?;
+    write_go2_odometry(store, &odom_rows, &world_frame)?;
     Ok((
         format!("{world_frame}:{GO2_CORRECTED_LIDAR_FRAME}"),
         GO2_CORRECTED_ODOMETRY_STREAM_NAME.to_string(),
@@ -443,6 +410,8 @@ pub fn normalize_go2_legacy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory2;
+    use rusqlite::Connection;
     use crate::memory2::read_scans;
 
     #[test]
@@ -501,11 +470,12 @@ mod tests {
 
     #[test]
     fn normalize_untouched_for_non_legacy() {
-        let connection = Connection::open_in_memory().unwrap();
-        memory2::create_stream(&connection, "pointlio_odometry", artifacts::ODOMETRY_MODULE)
+        let store = Store::Db(Connection::open_in_memory().unwrap());
+        let connection = store.connection().unwrap();
+        memory2::create_stream(connection, "pointlio_odometry", artifacts::ODOMETRY_MODULE)
             .unwrap();
         let result =
-            normalize_go2_legacy(&connection, "world:base", "pointlio_odometry", "pointlio_lidar")
+            normalize_go2_legacy(&store, "world:base", "pointlio_odometry", "pointlio_lidar")
                 .unwrap();
         assert_eq!(
             result,
@@ -519,35 +489,36 @@ mod tests {
 
     #[test]
     fn normalize_derives_l1_streams() {
-        let connection = Connection::open_in_memory().unwrap();
+        let store = Store::Db(Connection::open_in_memory().unwrap());
+        let connection = store.connection().unwrap();
         // legacy odom: bare PoseStamped moving along +x in "world"
-        memory2::create_stream(&connection, "odom", POSE_STAMPED_MODULE).unwrap();
+        memory2::create_stream(connection, "odom", POSE_STAMPED_MODULE).unwrap();
         for (index, ts) in [0.0f64, 1.0, 2.0].iter().enumerate() {
             let blob = pose_stamped_blob(*ts, "world", [index as f64, 0.0, 0.0]);
-            memory2::append(&connection, "odom", *ts, None, &[], &blob).unwrap();
+            memory2::append(connection, "odom", *ts, None, &[], &blob).unwrap();
         }
         // lidar pre-registered in "world": one point at the robot's x=1 pose + 1m forward
-        memory2::create_stream(&connection, "lidar", artifacts::POINTCLOUD2_MODULE).unwrap();
+        memory2::create_stream(connection, "lidar", artifacts::POINTCLOUD2_MODULE).unwrap();
         let scan = encode_pointcloud2(&[[2.0, 0.0, 0.0]], None, "world", 1.0);
-        memory2::append(&connection, "lidar", 1.0, None, &[], &scan).unwrap();
+        memory2::append(connection, "lidar", 1.0, None, &[], &scan).unwrap();
 
         let (odom_tf, odom, lidar) =
-            normalize_go2_legacy(&connection, "", "odom", "lidar").unwrap();
+            normalize_go2_legacy(&store, "", "odom", "lidar").unwrap();
         assert_eq!(odom_tf, "world:l1_link");
         assert_eq!(odom, "go2_odometry");
         assert_eq!(lidar, "l1_cloud");
 
         // scan un-registered into the sensor frame: 1m forward of the x=1 pose
-        let scans = read_scans(&connection, "l1_cloud", 1).unwrap();
+        let scans = read_scans(connection, "l1_cloud", 1).unwrap();
         assert_eq!(scans.len(), 1);
         assert_eq!(scans[0].frame_id, "l1_link");
         assert!((scans[0].points[0][0] - 1.0).abs() < 1e-5);
         // odometry readable as proper Odometry with the l1_link child
-        let odom_rows = read_odometry(&connection, "go2_odometry", 1).unwrap();
+        let odom_rows = read_odometry(connection, "go2_odometry", 1).unwrap();
         assert_eq!(odom_rows.len(), 3);
         assert_eq!(odom_rows[1].child_frame_id, "l1_link");
         // static tf edge present exactly once, and re-running does not duplicate it
-        let tf_samples = read_tf(&connection, TF_STREAM).unwrap();
+        let tf_samples = read_tf(connection, TF_STREAM).unwrap();
         let l1_edges = |samples: &[crate::memory2::TfSample]| {
             samples
                 .iter()
@@ -555,8 +526,8 @@ mod tests {
                 .count()
         };
         assert_eq!(l1_edges(&tf_samples), 1);
-        normalize_go2_legacy(&connection, "", "odom", "lidar").unwrap();
-        let tf_again = read_tf(&connection, TF_STREAM).unwrap();
+        normalize_go2_legacy(&store, "", "odom", "lidar").unwrap();
+        let tf_again = read_tf(connection, TF_STREAM).unwrap();
         assert_eq!(l1_edges(&tf_again), 1);
     }
 }

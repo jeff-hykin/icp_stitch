@@ -8,9 +8,9 @@ use std::process::exit;
 
 use clap::Parser;
 use gtsam_shim::Pose3;
-use rusqlite::{Connection, OpenFlags};
 
 use icp_stitch::apriltags::{self, GlimpseGates};
+use icp_stitch::store::Store;
 use icp_stitch::{artifacts, detect, helpers, mat3, memory2, pgo, recording, se3, tf};
 
 const ABOUT: &str = "\
@@ -22,21 +22,23 @@ Two-stage solve turns drifty odometry into a ground-truth trajectory:
   2. ICP loop closures between spatially-close / temporally-distant lidar submaps anchor
      local geometry, then re-solve.
 
-Outputs written back into the recording db: <odom>_corrected, <lidar>_corrected,
+Outputs written back into the recording: <odom>_corrected, <lidar>_corrected,
 tf_corrected (a near-duplicate of the recorded tf tree driven by the corrected
 trajectory, so every corrected stream places through the usual tf chain),
 tf_deformation_nodes_corrected, pose_graph, and raycast-accumulated maps; plus an
 aggregated <lidar>_corrected.pc2.lcm and a comparison rrd opened in rerun.
 
---db is the recording .db file; its parent dir is where the .pc2.lcm outputs land. Camera
+--recording (alias --db) is the recording: a memory2 .db, or an .mcap (CDR or dimos LCM
+topics; outputs are appended to it in place as CDR topics). Its parent dir is where the
+.pc2.lcm outputs land. Camera
 intrinsics come from the recording's CameraInfo stream (auto-detected) and the base<-optical
 extrinsic from its tf tree; stream/frame defaults auto-detect the rig. With no CameraInfo
 stream the AprilTag stage is skipped and ICP loop closures alone drive the PGO; a go2 recording
 can get one with --helper add_go2_camera_info.
 
 Usage:
-  icp_stitch --db PATH.db [--no-odom | --no-lidar] [options]
-  icp_stitch --db PATH.db --helper add_go2_camera_info";
+  icp_stitch --recording PATH.db|PATH.mcap [--no-odom | --no-lidar] [options]
+  icp_stitch --recording PATH.db --helper add_go2_camera_info";
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum Helper {
@@ -48,10 +50,10 @@ enum Helper {
 #[derive(Parser)]
 #[command(name = "icp_stitch", about = ABOUT)]
 struct Args {
-    /// recording .db file
-    #[arg(long)]
+    /// the recording: a memory2 .db, or an .mcap (outputs are appended to it in place)
+    #[arg(long = "recording", visible_alias = "db", value_name = "PATH")]
     db: PathBuf,
-    /// run a one-shot recording fixup on --db and exit, instead of solving
+    /// run a one-shot recording fixup on --recording and exit, instead of solving
     #[arg(long = "helper", alias = "helpers", value_enum)]
     helper: Option<Helper>,
     /// input lidar stream (auto if unset)
@@ -245,38 +247,34 @@ fn main() {
 fn run(args: Args) -> Result<(), String> {
     let tuning = args.tuning();
     let db_path = &args.db;
-    if db_path.is_dir() {
-        return Err(format!(
-            "--db must be a .db file, not a directory: {}",
-            db_path.display()
-        ));
-    }
     let rec_dir = db_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|error| format!("cannot open {}: {error}", db_path.display()))?;
+    // dropping it before `finish` (an error, a panic) puts an .mcap's last summary back
+    let recording_store = Store::open(db_path)?;
+    let store = &recording_store;
 
     if let Some(helper) = args.helper {
         return match helper {
             Helper::AddGo2CameraInfo => {
-                helpers::add_go2_camera_info(&connection, &args.camera)
+                helpers::add_go2_camera_info(store, &args.camera)?;
+                store.finish()
             }
         };
     }
 
     // resolve stream/frame defaults from what the recording actually has
-    let streams = memory2::list_streams(&connection)?;
+    let streams = store.list_streams()?;
     let (odom_stream, lidar_stream) = recording::resolve_streams(&streams, &args.odom, &args.lidar);
     let odom_tf = if args.odom_tf.is_empty() {
-        recording::default_odom_edge(&connection, &odom_stream)
+        recording::default_odom_edge(store, &odom_stream)
     } else {
         args.odom_tf.clone()
     };
     // legacy go2 recordings are massaged into the generic shape here; every other rig is a no-op
     let (odom_tf, odom_stream, lidar_stream) =
-        recording::normalize_go2_legacy(&connection, &odom_tf, &odom_stream, &lidar_stream)?;
+        recording::normalize_go2_legacy(store, &odom_tf, &odom_stream, &lidar_stream)?;
     let body_frame = if odom_tf.is_empty() {
         args.world_frame.clone()
     } else {
@@ -304,7 +302,7 @@ fn run(args: Args) -> Result<(), String> {
         .collect::<Result<_, _>>()?;
 
     let (camera_info, camera_info_tried) =
-        detect::resolve_camera_info(&connection, &args.camera, &args.camera_info_stream)?;
+        detect::resolve_camera_info(store, &args.camera, &args.camera_info_stream)?;
     let (camera_model, optical_frame) = match camera_info {
         None => {
             println!(
@@ -325,7 +323,7 @@ fn run(args: Args) -> Result<(), String> {
         }
     };
     let tags_available = detect::ensure_raw_tag_stream(
-        &connection,
+        store,
         camera_model.as_ref(),
         &args.tags,
         &args.camera,
@@ -347,13 +345,13 @@ fn run(args: Args) -> Result<(), String> {
 
     // gate tags, pick keyframes, keep one best factor per keyframe x marker
     let raw_detections = if tags_available {
-        detect::read_raw_tag_stream(&connection, &args.tags)?
+        detect::read_raw_tag_stream(store, &args.tags)?
     } else {
         Vec::new()
     };
     let detections =
         apriltags::filter_glimpses(&raw_detections, &ignore_tags, &GlimpseGates::default());
-    let odom_full = memory2::read_odometry(&connection, &odom_stream, 1).map_err(|error| {
+    let odom_full = memory2::read_odometry(store, &odom_stream, 1).map_err(|error| {
         if error.contains("decoded no") {
             format!(
                 "odom stream '{odom_stream}' is empty in {}",
@@ -386,9 +384,9 @@ fn run(args: Args) -> Result<(), String> {
 
     // tf tree with the odom edge overridden by the odom trajectory (python
     // RecordingTF.from_store(store, odom_tf=..., odom_stream=...))
-    let streams = memory2::list_streams(&connection)?;
+    let streams = store.list_streams()?;
     let tf_samples = if streams.iter().any(|s| s == "tf") {
-        memory2::read_tf(&connection, "tf")?
+        memory2::read_tf(store, "tf")?
     } else {
         Vec::new()
     };
@@ -453,7 +451,7 @@ fn run(args: Args) -> Result<(), String> {
     // stage 2: ICP loop closures
     let (scans, scans_outside) = if args.icp || args.write_lidar {
         let (first, last) = (odom_rows[0][0], odom_rows[odom_rows.len() - 1][0]);
-        let (kept, outside): (Vec<_>, Vec<_>) = memory2::read_scans(&connection, &lidar_stream, 1)?
+        let (kept, outside): (Vec<_>, Vec<_>) = memory2::read_scans(store, &lidar_stream, 1)?
             .into_iter()
             .partition(|scan| scan.ts >= first && scan.ts <= last);
         if !outside.is_empty() {
@@ -509,9 +507,21 @@ fn run(args: Args) -> Result<(), String> {
         seen_markers.len()
     );
 
-    // persist PGO artifacts
+    // persist PGO artifacts (an .mcap first drops a previous run's, giving their space back)
+    let corrected_odom_out = format!("{odom_stream}{}{}", args.corrected_suffix, args.suffix);
+    let corrected_tf_out = format!("tf{frame_suffix}");
+    let lidar_out = format!("{lidar_stream}{}{}", args.corrected_suffix, args.suffix);
+    store.prepare_outputs(&[
+        format!("tf_deformation_nodes{}{}", args.corrected_suffix, args.suffix),
+        format!("pose_graph{}", args.suffix),
+        corrected_odom_out.clone(),
+        corrected_tf_out.clone(),
+        lidar_out.clone(),
+        format!("{lidar_stream}_accumulated"),
+        format!("{lidar_out}_accumulated"),
+    ])?;
     artifacts::write_deformation_nodes(
-        &connection,
+        store,
         &format!(
             "tf_deformation_nodes{}{}",
             args.corrected_suffix, args.suffix
@@ -523,18 +533,16 @@ fn run(args: Args) -> Result<(), String> {
         &body_frame,
     )?;
     artifacts::write_pose_graph(
-        &connection,
+        store,
         &format!("pose_graph{}", args.suffix),
         &keyframe_times,
         &optimized,
         &args.world_frame,
     )?;
 
-    let corrected_odom_out = format!("{odom_stream}{}{}", args.corrected_suffix, args.suffix);
-    let corrected_tf_out = format!("tf{frame_suffix}");
     if args.write_odom {
         artifacts::write_corrected_odom(
-            &connection,
+            store,
             &corrected_odom_out,
             &odom_rows,
             &keyframe_times,
@@ -543,7 +551,7 @@ fn run(args: Args) -> Result<(), String> {
             &corrected_body_frame,
         )?;
         artifacts::write_corrected_tf_tree(
-            &connection,
+            store,
             &corrected_tf_out,
             &tf_samples,
             &odom_rows,
@@ -557,10 +565,9 @@ fn run(args: Args) -> Result<(), String> {
     }
 
     if args.write_lidar {
-        let lidar_out = format!("{lidar_stream}{}{}", args.corrected_suffix, args.suffix);
         let lcm_path = args.lcm.then(|| rec_dir.join(format!("{lidar_out}.pc2.lcm")));
         artifacts::write_corrected_lidar(
-            &connection,
+            store,
             &lidar_out,
             &scans,
             &odom_rows,
@@ -574,7 +581,7 @@ fn run(args: Args) -> Result<(), String> {
         )?;
         if args.accum {
             artifacts::raycast_accumulate(
-                &connection,
+                store,
                 &lidar_stream,
                 &scans,
                 &store_tf,
@@ -582,19 +589,19 @@ fn run(args: Args) -> Result<(), String> {
                 args.accum_voxel,
                 args.accum_max_range,
             )?;
-            if memory2::list_streams(&connection)?
+            if store.list_streams()?
                 .iter()
                 .any(|s| s == &corrected_tf_out)
             {
                 // the corrected tree places the corrected-framed per-scan clouds back into
                 // the world; it also supplies the ray origin for the corrected raycast.
                 let corrected_store_tf = tf::RecordingTf::from_samples(&memory2::read_tf(
-                    &connection,
+                    store,
                     &corrected_tf_out,
                 )?);
-                let corrected_scans = memory2::read_scans(&connection, &lidar_out, 1)?;
+                let corrected_scans = memory2::read_scans(store, &lidar_out, 1)?;
                 artifacts::raycast_accumulate(
-                    &connection,
+                    store,
                     &lidar_out,
                     &corrected_scans,
                     &corrected_store_tf,
@@ -611,7 +618,7 @@ fn run(args: Args) -> Result<(), String> {
         #[cfg(feature = "rrd")]
         if args.rrd {
             icp_stitch::rrd::build_and_open_rrd(
-                &connection,
+                store,
                 db_path,
                 &lidar_stream,
                 &odom_stream,
@@ -629,5 +636,5 @@ fn run(args: Args) -> Result<(), String> {
     if scans_outside > 0 {
         println!("skipped {scans_outside} lidar scans outside the odometry's time range");
     }
-    Ok(())
+    store.finish()
 }
