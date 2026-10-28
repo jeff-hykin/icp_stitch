@@ -223,6 +223,7 @@ fn accumulate(
     let scans = memory2::read_scans(connection, stream_name, SCAN_STRIDE)
         .map_err(|_| format!("stream '{stream_name}' has no points in {}", db_path.display()))?;
     let mut all_points: Vec<[f32; 3]> = Vec::new();
+    let mut unplaced = 0usize;
     for scan in &scans {
         if scan.points.is_empty() {
             continue;
@@ -233,7 +234,11 @@ fn accumulate(
             } else {
                 &scan.frame_id
             };
-            let pose = store_tf.get(world_frame, scan_frame, scan.ts)?;
+            // a scan outside the trajectory's time range has no pose; leave it out of the picture
+            let Ok(pose) = store_tf.get(world_frame, scan_frame, scan.ts) else {
+                unplaced += 1;
+                continue;
+            };
             for point in scan.points.iter().step_by(POINT_STRIDE) {
                 let p = [point[0] as f64, point[1] as f64, point[2] as f64];
                 let world = mat3::add(&mat3::mat_vec(&pose.rotation, &p), &pose.translation);
@@ -242,6 +247,9 @@ fn accumulate(
         } else {
             all_points.extend(scan.points.iter().step_by(POINT_STRIDE));
         }
+    }
+    if unplaced > 0 {
+        println!("rrd: left out {unplaced} '{stream_name}' scans with no tf pose (outside the trajectory)");
     }
     if all_points.is_empty() {
         return Err(format!(

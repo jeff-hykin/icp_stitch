@@ -451,10 +451,22 @@ fn run(args: Args) -> Result<(), String> {
     let raw_keyframe_poses = keyframe_poses.clone();
 
     // stage 2: ICP loop closures
-    let scans = if args.icp || args.write_lidar {
-        memory2::read_scans(&connection, &lidar_stream, 1)?
+    let (scans, scans_outside) = if args.icp || args.write_lidar {
+        let (first, last) = (odom_rows[0][0], odom_rows[odom_rows.len() - 1][0]);
+        let (kept, outside): (Vec<_>, Vec<_>) = memory2::read_scans(&connection, &lidar_stream, 1)?
+            .into_iter()
+            .partition(|scan| scan.ts >= first && scan.ts <= last);
+        if !outside.is_empty() {
+            println!(
+                "skipping {} of {} lidar scans outside the odometry's time range \
+                 [{first:.4}, {last:.4}] (no pose to place them with)",
+                outside.len(),
+                kept.len() + outside.len()
+            );
+        }
+        (kept, outside.len())
     } else {
-        Vec::new()
+        (Vec::new(), 0)
     };
     if args.icp {
         let accepted = pgo::add_icp_closures(
@@ -613,6 +625,9 @@ fn run(args: Args) -> Result<(), String> {
         if args.rrd {
             println!("WARNING: this build has no rerun support (feature `rrd`), so no .rrd was written");
         }
+    }
+    if scans_outside > 0 {
+        println!("skipped {scans_outside} lidar scans outside the odometry's time range");
     }
     Ok(())
 }
