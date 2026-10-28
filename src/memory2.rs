@@ -255,6 +255,24 @@ pub struct TfSample {
     pub quaternion_xyzw: [f64; 4],
 }
 
+/// The `parent:child` edge of the `tf` stream as odometry rows (time order, one per stamp).
+pub fn odometry_from_tf(connection: &(impl Rows + ?Sized), edge: &str) -> Result<Vec<OdomRow>, String> {
+    let (parent, child) = edge.split_once(':').ok_or_else(|| format!("tf edge must be 'parent:child', got '{edge}'"))?;
+    let bare = |frame: &str| frame.trim_start_matches('/').to_string();
+    let (parent, child) = (bare(parent), bare(child));
+    let mut samples: Vec<TfSample> =
+        read_tf(connection, "tf")?.into_iter().filter(|s| bare(&s.parent) == parent && bare(&s.child) == child).collect();
+    samples.sort_by(|a, b| a.ts.total_cmp(&b.ts));
+    samples.dedup_by(|a, b| (a.ts - b.ts).abs() < 1e-9);
+    if samples.is_empty() {
+        return Err(format!("the tf stream has no {parent} -> {child} edge to take the odometry from"));
+    }
+    Ok(samples
+        .into_iter()
+        .map(|s| odom_from_pose(s.ts, s.translation, s.quaternion_xyzw, parent.clone(), child.clone()))
+        .collect())
+}
+
 /// Read a tf stream of TFMessage rows, flattened to per-edge samples.
 pub fn read_tf(connection: &(impl Rows + ?Sized), stream: &str) -> Result<Vec<TfSample>, String> {
     let nested = connection.read_stream(stream, 1, |row_ts, data| {

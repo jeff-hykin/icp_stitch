@@ -57,6 +57,8 @@ auto-detected; every stage can be overridden or disabled:
 --camera <CAMERA>            color image stream, used to detect tags when missing
 --camera-info-stream <S>     CameraInfo stream (default camera_info)
 --odom-tf <PARENT:CHILD>     tf edge the odometry stream drives (auto-resolved)
+--odom-from-tf               take the odometry from that tf edge instead of a stream (--odom names the outputs)
+--lidar-every <N>            read every Nth lidar scan for the ICP submaps (default 1)
 --world-frame <FRAME>        world frame label (default world)
 --base-optical "x y z qx qy qz qw"   camera extrinsic override
 --marker-length <M>          tag side length in meters (default 0.1)
@@ -104,6 +106,9 @@ icp_stitch --recording path/to/recording.mcap
   of their own: `dimos_msgs/msg/Graph3D` (`pose_graph`), `dimos_msgs/msg/DeformationNode`
   (`tf_deformation_nodes_corrected`) and `dimos_msgs/msg/AprilTagDetection`
   (`raw_april_tags`, carrying the gate diagnostics a `.db` keeps in row tags).
+- The Map Editor's appended topics are read the way it reads them: of a topic it wrote several times
+  (`map_builder_generation`), only the newest; its raw AprilTags (dimos LCM `PoseStamped` with the gate
+  diagnostics as a JSON string per message on `<topic>/tags`) are read as tags.
 - go2-legacy (bare `PoseStamped` odometry) recordings still need a `.db`.
 
 ## Helpers

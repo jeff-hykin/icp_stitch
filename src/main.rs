@@ -100,6 +100,13 @@ struct Args {
     /// 'parent:child' edge the odom overrides
     #[arg(long = "odom-tf", default_value = "")]
     odom_tf: String,
+    /// take the odometry from the tf stream's --odom-tf edge instead of an odometry stream (--odom then only names
+    /// the outputs: '<odom>_corrected', ...)
+    #[arg(long = "odom-from-tf")]
+    odom_from_tf: bool,
+    /// read every Nth lidar scan for the ICP submaps (1 = all)
+    #[arg(long = "lidar-every", default_value_t = 1)]
+    lidar_every: usize,
     /// max one ICP loop closure per this many meters of odom path (<=0 disables thinning)
     #[arg(long = "closure-spacing", default_value_t = 2.0)]
     closure_spacing: f64,
@@ -267,6 +274,9 @@ fn run(args: Args) -> Result<(), String> {
     // resolve stream/frame defaults from what the recording actually has
     let streams = store.list_streams()?;
     let (odom_stream, lidar_stream) = recording::resolve_streams(&streams, &args.odom, &args.lidar);
+    if args.odom_from_tf && !args.odom_tf.contains(':') {
+        return Err("--odom-from-tf needs --odom-tf parent:child, the tf edge to take the odometry from".into());
+    }
     let odom_tf = if args.odom_tf.is_empty() {
         recording::default_odom_edge(store, &odom_stream)
     } else {
@@ -351,7 +361,12 @@ fn run(args: Args) -> Result<(), String> {
     };
     let detections =
         apriltags::filter_glimpses(&raw_detections, &ignore_tags, &GlimpseGates::default());
-    let odom_full = memory2::read_odometry(store, &odom_stream, 1).map_err(|error| {
+    let odom_full = if args.odom_from_tf {
+        memory2::odometry_from_tf(store, &odom_tf)
+    } else {
+        memory2::read_odometry(store, &odom_stream, 1)
+    }
+    .map_err(|error| {
         if error.contains("decoded no") {
             format!(
                 "odom stream '{odom_stream}' is empty in {}",
@@ -451,7 +466,7 @@ fn run(args: Args) -> Result<(), String> {
     // stage 2: ICP loop closures
     let (scans, scans_outside) = if args.icp || args.write_lidar {
         let (first, last) = (odom_rows[0][0], odom_rows[odom_rows.len() - 1][0]);
-        let (kept, outside): (Vec<_>, Vec<_>) = memory2::read_scans(store, &lidar_stream, 1)?
+        let (kept, outside): (Vec<_>, Vec<_>) = memory2::read_scans(store, &lidar_stream, args.lidar_every.max(1))?
             .into_iter()
             .partition(|scan| scan.ts >= first && scan.ts <= last);
         if !outside.is_empty() {

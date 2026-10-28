@@ -40,6 +40,10 @@ const POSE_STAMPED_MODULE: &str = "dimos.msgs.geometry_msgs.PoseStamped.PoseStam
 const GRAPH3D_MODULE: &str = "dimos.navigation.jnav.msgs.Graph3D.Graph3D";
 const DEFORMATION_NODE_MODULE: &str = "dimos.navigation.jnav.msgs.DeformationNode.DeformationNode";
 
+/// The Map Editor's channel metadata: a channel it appended (newest wins), and a tf channel overriding one edge.
+const MAP_BUILDER_GENERATION: &str = "map_builder_generation";
+const MAP_BUILDER_EDGE: &str = "map_builder_edge";
+
 /// Flush an output's buffered messages into a chunk at about this size.
 const CHUNK_TARGET: usize = 4 << 20;
 /// How far a header stamp may sit from its log time when windowing by log time.
@@ -480,6 +484,25 @@ impl McapStore {
             .collect()
     }
 
+    /// Of a stream's channels, the ones a reader takes: the newest generation when the Map Editor appended any
+    /// (`map_builder_generation`, as its own readers do; a `map_builder_edge` tf override doesn't count, every tf
+    /// channel is read), else all of them.
+    fn current(&self, channels: Vec<(u16, Encoding)>) -> Vec<(u16, Encoding)> {
+        let file = self.file.borrow();
+        let generation = |id: &u16| {
+            let channel = file.summary.channels.get(id)?;
+            if channel.meta(MAP_BUILDER_EDGE).is_some() {
+                return None;
+            }
+            channel.meta(MAP_BUILDER_GENERATION)?.parse::<f64>().ok()
+        };
+        let newest = channels.iter().filter_map(|(id, _)| generation(id).map(|g| (g, *id))).max_by(|a, b| a.0.total_cmp(&b.0));
+        match newest {
+            Some((_, id)) => channels.into_iter().filter(|(other, _)| *other == id).collect(),
+            None => channels,
+        }
+    }
+
     fn list_streams(&self) -> Result<Vec<String>, String> {
         self.flush()?;
         let file = self.file.borrow();
@@ -514,7 +537,7 @@ impl McapStore {
         mut each: impl FnMut(f64, u64, &Encoding, &[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
         self.flush()?;
-        let channels = self.channels(stream);
+        let channels = self.current(self.channels(stream));
         let ids: HashSet<u16> = channels.iter().map(|(id, _)| *id).collect();
         let encodings: BTreeMap<u16, Encoding> = channels.into_iter().collect();
         self.file.borrow_mut().for_each_message(&ids, window.0, window.1, |message| {
@@ -616,7 +639,35 @@ impl McapStore {
 
     fn read_tag_rows(&self, stream: &str) -> Result<Vec<(f64, Vec<u8>, Vec<Value>)>, String> {
         let mut rows = Vec::new();
+        // the Map Editor's form: dimos LCM PoseStamped, the diagnostics a JSON string per message, in the same order,
+        // on `<topic>/tags`
+        let mut companion: Vec<serde_json::Value> = Vec::new();
+        let tags_topic = self.channels(stream).first().and_then(|(id, _)| self.file.borrow().summary.channels.get(id).map(|c| format!("{}/tags", c.topic)));
+        if let Some(tags_topic) = tags_topic.filter(|topic| !self.channels(topic).is_empty()) {
+            self.visit(&tags_topic, (0, u64::MAX), |_, _, _, data| {
+                let text = lcm_msgs::std_msgs::String::decode(&decompress_if_lz4(data.to_vec())).map(|s| s.data).unwrap_or_default();
+                companion.push(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null));
+                Ok(())
+            })?;
+        }
+        let mut index = 0usize;
         self.visit(stream, (0, u64::MAX), |ts, _, encoding, data| {
+            if let Encoding::Lcm = encoding {
+                let blob = decompress_if_lz4(data.to_vec());
+                PoseStamped::decode(&blob).map_err(|e| format!("'{stream}': not a PoseStamped tag: {e}"))?;
+                let tags = companion.get(index).cloned().unwrap_or(serde_json::Value::Null);
+                index += 1;
+                let number = |key: &str| match &tags[key] {
+                    serde_json::Value::Number(n) => n.as_f64().map_or(Value::Null, Value::Real),
+                    serde_json::Value::String(text) => text.parse::<f64>().map_or(Value::Null, Value::Real),
+                    _ => Value::Null,
+                };
+                let marker = tags["marker_id"].as_i64().or_else(|| tags["marker_id"].as_f64().map(|v| v as i64));
+                let mut values = vec![marker.map_or(Value::Null, Value::Integer)];
+                values.extend(TAG_KEYS[1..].iter().map(|key| number(key)));
+                rows.push((ts, blob, values));
+                return Ok(());
+            }
             let Encoding::Cdr(schema) = encoding else {
                 return Err(format!("'{stream}' is not a {} topic", cdr::APRIL_TAG_DETECTION));
             };
@@ -777,6 +828,87 @@ mod tests {
         tf.transforms.push(Default::default());
         tf.transforms[0].header.stamp.sec = 9;
         assert_eq!(lcm_header_stamp(&tf.encode()), Some(9.0));
+    }
+
+    /// Appends one channel of `(log time s, payload)` messages to the mcap at `path`.
+    fn add_channel(path: &Path, topic: &str, metadata: Vec<(String, String)>, messages: &[(f64, Vec<u8>)]) {
+        use crate::mcap::OP_MESSAGE;
+        let mut mcap = McapFile::open(path).unwrap();
+        let (id, mut blob) = mcap.add_channel(Channel { id: 0, schema_id: 0, topic: topic.into(), message_encoding: "lcm".into(), metadata }).unwrap();
+        let mut entries = Vec::new();
+        for (ts, payload) in messages {
+            let time = (ts * 1e9) as u64;
+            entries.push((time, blob.len() as u64));
+            let mut body = id.to_le_bytes().to_vec();
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&time.to_le_bytes());
+            body.extend_from_slice(&time.to_le_bytes());
+            body.extend_from_slice(payload);
+            blob.extend_from_slice(&record(OP_MESSAGE, &body));
+        }
+        mcap.append_chunk(id, &blob, &entries).unwrap();
+        mcap.commit().unwrap();
+    }
+
+    /// the Map Editor's tags: LCM PoseStamped + a JSON string each on `<topic>/tags`, newest generation only
+    #[test]
+    fn map_editor_tags_are_read_from_the_newest_generation() {
+        let dir = std::env::temp_dir().join(format!("icp_stitch_tags_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.mcap");
+        crate::mcap::tests::tiny_mcap(&path);
+        let generation = |g: &str| vec![("map_builder_generation".to_string(), g.to_string())];
+        let pose = |ts: f64, x: f64| {
+            let mut message = PoseStamped::default();
+            message.header.stamp.sec = ts as i32;
+            message.header.frame_id = "camera_optical".into();
+            message.pose.position.x = x;
+            message.pose.orientation.w = 1.0;
+            message.encode()
+        };
+        let text = |marker: i64, sharpness: f64| lcm_msgs::std_msgs::String { data: format!(r#"{{"marker_id":{marker},"sharpness":{sharpness},"reproj_px":0.5,"tag_px":40.0,"distance_m":1.0,"lin_speed":0.1,"ang_speed":2.0}}"#) }.encode();
+        // an older run, then the one to read
+        add_channel(&path, "raw_april_tags", generation("1.000000"), &[(1.0, pose(1.0, 9.0))]);
+        add_channel(&path, "raw_april_tags/tags", generation("1.000000"), &[(1.0, text(9, 1.0))]);
+        add_channel(&path, "raw_april_tags", generation("2.000000"), &[(1.0, pose(1.0, 1.0)), (2.0, pose(2.0, 2.0))]);
+        add_channel(&path, "raw_april_tags/tags", generation("2.000000"), &[(1.0, text(4, 80.0)), (2.0, text(5, 90.0))]);
+        let store = Store::open(&path).unwrap();
+        let detections = crate::detect::read_raw_tag_stream(&store, "raw_april_tags").unwrap();
+        let seen: Vec<(i64, f64, f64)> = detections.iter().map(|d| (d.marker_id, d.sharpness, d.t_cam_marker[0])).collect();
+        assert_eq!(seen, vec![(4, 80.0, 1.0), (5, 90.0, 2.0)]);
+        assert_eq!((detections[0].tag_px, detections[0].lin_speed), (40.0, 0.1));
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// odometry taken from a tf edge: that edge's samples only, in time order
+    #[test]
+    fn odometry_comes_from_a_tf_edge() {
+        let dir = std::env::temp_dir().join(format!("icp_stitch_tf_odom_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.mcap");
+        crate::mcap::tests::tiny_mcap(&path);
+        let tf = |ts: f64, edges: &[(&str, &str, f64)]| {
+            let mut message = TFMessage::default();
+            for (parent, child, x) in edges {
+                let mut entry = lcm_msgs::geometry_msgs::TransformStamped::default();
+                entry.header.stamp.sec = ts as i32;
+                entry.header.frame_id = parent.to_string();
+                entry.child_frame_id = child.to_string();
+                entry.transform.translation.x = *x;
+                entry.transform.rotation.w = 1.0;
+                message.transforms.push(entry);
+            }
+            message.encode()
+        };
+        add_channel(&path, "/tf", vec![], &[(2.0, tf(2.0, &[("odom", "body", 2.0), ("body", "lidar", 0.1)])), (1.0, tf(1.0, &[("odom", "body", 1.0)]))]);
+        let store = Store::open(&path).unwrap();
+        let rows = memory2::odometry_from_tf(&store, "odom:body").unwrap();
+        assert_eq!(rows.iter().map(|r| (r.ts, r.translation[0])).collect::<Vec<_>>(), vec![(1.0, 1.0), (2.0, 2.0)]);
+        assert_eq!((rows[0].frame_id.as_str(), rows[0].child_frame_id.as_str()), ("odom", "body"));
+        assert!(memory2::odometry_from_tf(&store, "odom:nothing").is_err());
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

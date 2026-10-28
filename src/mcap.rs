@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, Once};
 pub const MAGIC: &[u8; 8] = b"\x89MCAP0\r\n";
 const OP_SCHEMA: u8 = 0x03;
 const OP_CHANNEL: u8 = 0x04;
-const OP_MESSAGE: u8 = 0x05;
+pub(crate) const OP_MESSAGE: u8 = 0x05;
 const OP_CHUNK: u8 = 0x06;
 const OP_MESSAGE_INDEX: u8 = 0x07;
 const OP_CHUNK_INDEX: u8 = 0x08;
@@ -845,7 +845,7 @@ impl Drop for McapFile {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A minimal valid mcap: header, one zstd chunk holding a schema, channel and two
